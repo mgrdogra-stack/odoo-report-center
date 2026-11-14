@@ -361,4 +361,3 @@ def extract_purchase_register_fast(url, db, uid, pw, d_from, d_to, out_xlsx_path
 
     except Exception as e:
         return f"❌ Error: {str(e)}", None
-
