@@ -155,9 +155,132 @@ def extract_grir_transport_fast(url, db, uid, pw, acc_ids, d_from, d_to, out_xls
     if progress:
         progress(1.0, desc=f"Done! {curr_row - 1:,} rows exported.")
     return curr_row - 1, tot_debit, tot_credit, net_gl
-
 def extract_sale_register_fast(url, db, uid, pw, d_from, d_to, out_xlsx_path, progress, acc_ids=None):
     d1_str, d2_str = to_odoo_date(d_from), to_odoo_date(d_to)
     dom = [["parent_state", "=", "posted"], ["date", ">=", d1_str], ["date", "<=", d2_str]]
     dom.append(["account_id", "in", acc_ids] if acc_ids else ["account_id.code", "=like", "701%"])
 
+    fields = ["id", "date", "move_id", "move_name", "ref", "journal_id", "partner_id", "customer_code", "customer_name", "tin_no", "vat", "product_id", "product_code", "name", "quantity", "product_uom_id", "price_unit", "discount", "price_subtotal", "taxed_amt", "price_total", "debit", "credit", "balance", "account_id", "analytic_account_id", "team_id", "currency_id", "amount_currency"]
+    rows = rpc_fetch_all(url, db, uid, pw, "account.move.line", dom, fields, 2500, progress, "Revenue GL Lines", 0.10, 0.75)
+    if not rows:
+        return 0, 0.0, 0.0, 0.0
+
+    first_id = lambda val: next(iter(val), 0) if isinstance(val, list) and val else 0
+    move_ids = list({first_id(r.get("move_id")) for r in rows if first_id(r.get("move_id"))})
+    move_map = {}
+    for i in range(0, len(move_ids), 2000):
+        for m in execute_with_uid(url, db, uid, pw, "account.move", "read", [move_ids[i:i+2000]], {"fields": ["id", "name", "move_type", "invoice_date", "invoice_origin", "ref", "payment_state", "invoice_user_id"]}, timeout=180):
+            move_map[m["id"]] = m
+
+    workbook = xlsxwriter.Workbook(out_xlsx_path, {"constant_memory": True})
+    ws_main = workbook.add_worksheet("Sale_Register_Data")
+    ws_tb = workbook.add_worksheet("Trial_Balance_Check")
+
+    ws_main.write_row(0, 0, ["AML_ID", "Posting Date", "Invoice Date", "Journal", "Document Type", "Document No", "Source Order", "Reference", "Customer Code", "Customer Name", "TIN No", "VRN / VAT", "Product Code", "Product / Description", "Quantity", "UOM", "Unit Price", "Discount (%)", "GL Debit", "GL Credit", "Net Revenue (Credit - Debit)", "VAT / Tax Info", "Gross Invoice Line", "Revenue Account", "Analytic Account", "Sales Team", "Currency", "Amount Currency", "Salesperson", "Payment Status"])
+
+    tot_dr = tot_cr = tot_vat = tot_gross = 0.0
+    type_labels = {"out_invoice": "Customer Invoice", "out_refund": "Credit Note", "entry": "Journal Entry"}
+
+    for idx_r, r in enumerate(rows, start=1):
+        m_info = move_map.get(first_id(r.get("move_id")), {})
+        m_type = m_info.get("move_type", "entry")
+        sign = -1.0 if m_type == "out_refund" else 1.0
+        dr, cr = float(r.get("debit") or 0.0), float(r.get("credit") or 0.0)
+        tax_signed = float(r.get("taxed_amt") or 0.0) * sign
+        tot_signed = float(r.get("price_total") or 0.0) * sign
+        tot_dr += dr
+        tot_cr += cr
+        tot_vat += tax_signed
+        tot_gross += tot_signed
+
+        get_lbl = lambda k: str(r[k][-1]) if isinstance(r.get(k), list) and r[k] else ""
+        prt_name = r.get("customer_name") or re.sub(r"^\[.*?\]\s*", "", get_lbl("partner_id"))
+        usr_raw = m_info.get("invoice_user_id")
+        usr_lbl = str(usr_raw[-1]) if isinstance(usr_raw, list) and usr_raw else ""
+
+        ws_main.write_row(idx_r, 0, [r["id"], str(r.get("date") or ""), str(m_info.get("invoice_date") or ""), get_lbl("journal_id"), type_labels.get(m_type, m_type), str(r.get("move_name") or ""), str(m_info.get("invoice_origin") or ""), str(r.get("ref") or ""), str(r.get("customer_code") or ""), str(prt_name or ""), str(r.get("tin_no") or ""), str(r.get("vat") or ""), str(r.get("product_code") or ""), get_lbl("product_id") or str(r.get("name") or ""), float(r.get("quantity") or 0.0) * sign, get_lbl("product_uom_id"), float(r.get("price_unit") or 0.0), float(r.get("discount") or 0.0), dr, cr, cr - dr, tax_signed, tot_signed, get_lbl("account_id"), get_lbl("analytic_account_id"), get_lbl("team_id"), get_lbl("currency_id"), float(r.get("amount_currency") or 0.0), usr_lbl, str(m_info.get("payment_state") or "")])
+
+    net_tb_rev = tot_cr - tot_dr
+    ws_tb.write_row(0, 0, ["Metric", "Amount (TZS)"])
+    ws_tb.write_row(1, 0, ["Period", f"{d_from} to {d_to}"])
+    ws_tb.write_row(2, 0, ["Total Revenue GL Debits (Matches TB Debit)", tot_dr])
+    ws_tb.write_row(3, 0, ["Total Revenue GL Credits (Matches TB Credit)", tot_cr])
+    ws_tb.write_row(4, 0, ["Net Revenue (Credit - Debit — Matches TB Net)", net_tb_rev])
+    ws_tb.write_row(5, 0, ["Output VAT Info (Invoice Lines)", tot_vat])
+    ws_tb.write_row(6, 0, ["Total Exported GL Lines", len(rows)])
+
+    workbook.close()
+    if progress:
+        progress(1.0, desc=f"Done! {len(rows):,} Revenue GL lines exported.")
+    return len(rows), net_tb_rev, tot_dr, tot_cr
+
+def extract_purchase_register_fast(url, db, uid, pw, d_from, d_to, out_xlsx_path, progress, acc_ids=None):
+    d1_str, d2_str = to_odoo_date(d_from), to_odoo_date(d_to)
+    if acc_ids:
+        dom = [["parent_state", "=", "posted"], ["date", ">=", d1_str], ["date", "<=", d2_str], ["account_id", "in", acc_ids]]
+    else:
+        dom = [["parent_state", "=", "posted"], ["date", ">=", d1_str], ["date", "<=", d2_str], "|", "|", ["account_id.code", "=like", "551%"], ["account_id.code", "=like", "181%"], ["account_id.code", "in", ["731004", "751018"]]]
+
+    fields = ["id", "date", "move_id", "move_name", "ref", "journal_id", "partner_id", "tin_no", "vat", "product_id", "product_code", "name", "quantity", "product_uom_id", "price_unit", "price_subtotal", "taxed_amt", "price_total", "debit", "credit", "balance", "account_id", "analytic_account_id", "po_ref", "purchase_order_id", "is_landed_costs_line"]
+    rows = rpc_fetch_all(url, db, uid, pw, "account.move.line", dom, fields, 2500, progress, "Inventory & GRIR GL", 0.10, 0.65)
+    if not rows:
+        return 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+    first_id = lambda val: next(iter(val), 0) if isinstance(val, list) and val else 0
+
+    acc_id_set = list({first_id(r.get("account_id")) for r in rows if first_id(r.get("account_id"))})
+    acc_code_map = {}
+    for i in range(0, len(acc_id_set), 1000):
+        for a in execute_with_uid(url, db, uid, pw, "account.account", "read", [acc_id_set[i:i+1000]], {"fields": ["id", "code"]}, timeout=120):
+            acc_code_map[a["id"]] = str(a.get("code") or "")
+
+    move_ids = list({first_id(r.get("move_id")) for r in rows if first_id(r.get("move_id"))})
+    move_map, all_picking_ids = {}, set()
+    for i in range(0, len(move_ids), 2000):
+        for m in execute_with_uid(url, db, uid, pw, "account.move", "read", [move_ids[i:i+2000]], {"fields": ["id", "move_type", "invoice_date", "invoice_origin", "ref", "payment_state", "tbill_purchase_id", "custom_doc_ref_id", "grn_ids"]}, timeout=180):
+            move_map[m["id"]] = m
+            all_picking_ids.update(m.get("grn_ids") or list())
+
+    po_ids = list({first_id(r.get("purchase_order_id")) for r in rows if first_id(r.get("purchase_order_id"))})
+    po_names = list({str(r.get("po_ref") or "").strip() for r in rows if r.get("po_ref") and not r.get("purchase_order_id")})
+    po_map, po_by_name = {}, {}
+    for i in range(0, len(po_ids), 2000):
+        for po in execute_with_uid(url, db, uid, pw, "purchase.order", "read", [po_ids[i:i+2000]], {"fields": ["id", "name", "pr_id", "requisition_id", "custom_doc_ref_id", "picking_ids"]}, timeout=180):
+            po_map[po["id"]] = po_by_name[str(po.get("name") or "")] = po
+            all_picking_ids.update(po.get("picking_ids") or list())
+    for i in range(0, len(po_names), 1000):
+        for po in execute_with_uid(url, db, uid, pw, "purchase.order", "search_read", [[["name", "in", po_names[i:i+1000]]]], {"fields": ["id", "name", "pr_id", "requisition_id", "custom_doc_ref_id", "picking_ids"]}, timeout=180):
+            po_map[po["id"]] = po_by_name[str(po.get("name") or "")] = po
+
+    pick_name_map = {}
+    pick_list = list(all_picking_ids)
+    for i in range(0, len(pick_list), 2000):
+        for pk in execute_with_uid(url, db, uid, pw, "stock.picking", "read", [pick_list[i:i+2000]], {"fields": ["id", "name"]}, timeout=120):
+            pick_name_map[pk["id"]] = str(pk.get("name") or "")
+
+    workbook = xlsxwriter.Workbook(out_xlsx_path, {"constant_memory": True})
+    ws_main = workbook.add_worksheet("Purchase_Register_Data")
+    ws_tb = workbook.add_worksheet("Trial_Balance_Check")
+
+    ws_main.write_row(0, 0, ["AML_ID", "Ledger Group", "Account Code", "Account Name", "Entry Source", "Posting Date", "Bill / Doc Date", "Journal", "Bill / Document No", "Vendor Invoice Ref", "Vendor Name", "TIN No", "VRN / VAT", "PR Number", "PO Number", "GRN Number", "TANSAD No", "LC Number", "TBS / Origin", "Product Code", "Product / Description", "Quantity", "UOM", "Unit Price", "Taxable Amount (Bills)", "Input VAT (Bills)", "Gross Bill Amount", "GL Debit", "GL Credit", "Net GL Balance (Debit - Credit)", "Analytic Account", "Payment Status"])
+
+    acc_summary = {}
+    inv_dr = inv_cr = grir_dr = grir_cr = 0.0
+
+    for idx_r, r in enumerate(rows, start=1):
+        acc_pair = r.get("account_id")
+        acc_id = first_id(acc_pair)
+        acc_full = str(acc_pair[-1]) if isinstance(acc_pair, list) and acc_pair else ""
+        acc_code = acc_code_map.get(acc_id, next(iter(acc_full.split(" ")), "") if acc_full else "")
+        grp = "INVENTORY" if (acc_code.startswith("551") or acc_code in ("731004", "751018")) else "GRIR"
+
+        m_info = move_map.get(first_id(r.get("move_id")), {})
+        m_type = m_info.get("move_type", "entry")
+
+        ref_txt, name_txt, orig_txt = str(r.get("ref") or ""), str(r.get("name") or ""), str(m_info.get("invoice_origin") or "")
+        combo = f"{ref_txt} | {name_txt} | {orig_txt}"
+
+        po_pair = r.get("purchase_order_id")
+        po_id = first_id(po_pair)
+        m_po = re.search(r"([A-Z]+ORD/\d{4}/\d+)", combo)
+        po_no = (str(po_pair[-1]) if isinstance(po_pair, list) and po_pair else "") or str(r.get("po_ref") or "") or (m_po.group(1) if m_po else "")
