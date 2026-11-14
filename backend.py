@@ -285,7 +285,8 @@ def extract_purchase_register_fast(url, db, uid, pw, d_from, d_to, out_xlsx_path
         m_po = re.search(r"([A-Z]+ORD/\d{4}/\d+)", combo)
         po_no = (str(po_pair[-1]) if isinstance(po_pair, list) and po_pair else "") or str(r.get("po_ref") or "") or (m_po.group(1) if m_po else "")
         def run_wizard_and_download(url, db, user, pw, selected_label, wiz_map, params_json, btn_method, d_from, d_to, is_as_on, selected_accs, acc_map, progress=None):
-    STOP_EVENT.clear()
+    STOP_EVENT.clear()    
+    
     if not selected_label or selected_label not in wiz_map:
         return "⚠️ Please select a report wizard from the dropdown first.", None
     if not d_from.strip() or not d_to.strip():
