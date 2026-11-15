@@ -468,10 +468,14 @@ def disconnect_session():
 
 # Dynamic image loading & Base64 background mapping
 image_b64 = ""
-image_path = "/content/accounting-vs-finance-differences-ohsc.webp"
-if os.path.exists(image_path):
-    with open(image_path, "rb") as img_f:
-        image_b64 = base64.b64encode(img_f.read()).decode("utf-8")
+for candidate_path in [
+    "accounting-vs-finance-differences-ohsc.webp",
+    "/content/accounting-vs-finance-differences-ohsc.webp",
+]:
+    if os.path.exists(candidate_path):
+        with open(candidate_path, "rb") as img_f:
+            image_b64 = base64.b64encode(img_f.read()).decode("utf-8")
+        break
 
 custom_css = f"""
 html, body, .gradio-container, .gradio-container-3-50, #component-0 {{
@@ -691,4 +695,10 @@ gr.close_all()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    demo.launch(server_name="0.0.0.0", server_port=port, share=False)
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=port,
+        share=False,
+        theme=gr.themes.Soft(primary_hue="amber", secondary_hue="stone"),
+        css=custom_css,
+    )
