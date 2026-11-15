@@ -388,19 +388,19 @@ def extract_grir_transport_fast(url, db, uid, pw, acc_ids, d_from, d_to, out_xls
         ref_txt = str(r.get("ref") or "")
         name_txt = str(r.get("name") or "")
         combo = f"{ref_txt} | {name_txt}"
-        m_lc = re.search(r"(LC/\\d{4}/\\d+)", combo)
-        m_grn = re.search(r"(CM/GRN/\\d{4}/\\d+)", combo)
-        m_po = re.search(r"([A-Z]+ORD/\\d{4}/\\d+)", combo)
+        m_lc = re.search(r"(LC/\d{4}/\d+)", combo)
+        m_grn = re.search(r"(CM/GRN/\d{4}/\d+)", combo)
+        m_po = re.search(r"([A-Z]+ORD/\d{4}/\d+)", combo)
         lc_no = m_lc.group(1) if m_lc else ""
         grn_no = m_grn.group(1) if m_grn else ""
         po_no = m_po.group(1) if m_po else str(r.get("po_ref") or "")
         p_name = r["partner_id"][1] if isinstance(r.get("partner_id"), list) else ""
-        p_clean = re.sub(r"^\\[.*?\\]\\s*", "", p_name)
+        p_clean = re.sub(r"^\[.*?\].*", "", p_name)
 
         entry = {
             "id": r["id"],
             "date": str(r.get("date") or ""),
-            "move_id": r["move_id"][0] if isinstance(r.get("move_id"), list) else False,
+            "move_id": r["move_id"],
             "move_name": str(r.get("move_name") or ""),
             "ref": ref_txt,
             "name": name_txt,
@@ -413,14 +413,14 @@ def extract_grir_transport_fast(url, db, uid, pw, acc_ids, d_from, d_to, out_xls
             "balance": float(r.get("balance") or 0.0),
         }
         if entry["debit"] > 0 and entry["move_id"]:
-            bill_move_ids.add(entry["move_id"])
+            bill_move_ids.add(entry["move_id"].get(0) if isinstance(entry["move_id"], list) else entry["move_id"])
             bill_lines.append(entry)
         else:
             all_lc_rows.append(entry)
             if grn_no:
                 lc_by_grn.setdefault(grn_no, list()).append(entry)
 
-    progress(0.50, desc=f"Linking {len(bill_move_ids):,} Vendor Bills to TBS records...")
+    progress(0.50, desc="Linking bills...")
     move_map = {}
     tbs_ids = set()
     m_id_list = list(bill_move_ids)
@@ -429,280 +429,230 @@ def extract_grir_transport_fast(url, db, uid, pw, acc_ids, d_from, d_to, out_xls
         m_recs = execute_with_uid(url, db, uid, pw, "account.move", "read", [batch_ids], {"fields": ["id", "name", "ref", "invoice_date", "invoice_origin", "tbill_purchase_id", "partner_id"]}, timeout=180)
         for m in m_recs:
             move_map[m["id"]] = m
-            if isinstance(m.get("tbill_purchase_id"), list):
-                tbs_ids.add(m["tbill_purchase_id"][0])
 
-    progress(0.65, desc=f"Fetching GRN links for {len(tbs_ids):,} TBS settlements...")
-    tbs_lines_by_settle = {}
-    t_id_list = list(tbs_ids)
-    for i in range(0, len(t_id_list), 500):
-        batch_tids = t_id_list[i:i+500]
-        t_lines = execute_with_uid(
-            url, db, uid, pw, "transporter.bill.purchase.line", "search_read",
-            [[["settlement_id", "in", batch_tids]]],
-            {"fields": ["settlement_id", "grn_nos", "grn_date", "vendor", "partner_id", "purchase_orders", "product", "qty_ton", "freight_amount", "vendor_bill_no", "vendor_bill_date"], "limit": 50000},
-            timeout=180
-        )
-        for tl in t_lines:
-            sid = tl["settlement_id"][0] if isinstance(tl.get("settlement_id"), list) else False
-            if sid:
-                tbs_lines_by_settle.setdefault(sid, list()).append(tl)
-
-    progress(0.82, desc="Building Trial-Balance-exact GRIR Transport workbook...")
     workbook = xlsxwriter.Workbook(out_xlsx_path, {"constant_memory": True})
     ws_main = workbook.add_worksheet("GRIR_Transport_Breakup")
-    ws_tb = workbook.add_worksheet("Trial_Balance_Check")
-    ws_raw = workbook.add_worksheet("Raw_GRIR_Ledger_Lines")
-
-    headers_main = [
-        "TBS Bill No", "TBS Number", "TBS Vendor", "TBS Bill Date", "Posting Date",
-        "LC", "LC Date", "Year (LC Date)", "Month (LC Date)",
-        "Partner Name (GRN Vendor)", "Transport Name", "GRN", "PO Number", "Product",
-        "Sum of TBS Amount", "Sum of LC Amount", "Sum of Bill Amount", "Net Amount", "Status"
-    ]
-    ws_main.write_row(0, 0, headers_main)
-
-    curr_row = 1
-    matched_lc_ids = set()
-
-    for bl in bill_lines:
-        m_info = move_map.get(bl["move_id"], {})
-        bill_no = m_info.get("name") or bl["move_name"]
-        tbs_pair = m_info.get("tbill_purchase_id")
-        tbs_id = tbs_pair[0] if isinstance(tbs_pair, list) else False
-        tbs_num = tbs_pair[1] if isinstance(tbs_pair, list) else str(m_info.get("invoice_origin") or "")
-        tbs_vnd_inv = str(m_info.get("ref") or bl["ref"] or "")
-        tbs_bill_dt = str(m_info.get("invoice_date") or bl["date" ] or "")
-        trans_name = bl["partner"]
-
-        linked_grn_lines = tbs_lines_by_settle.get(tbs_id, list()) if tbs_id else list()
-        if linked_grn_lines:
-            for idx_g, gl in enumerate(linked_grn_lines):
-                grn_code = str(gl.get("grn_nos") or "").strip()
-                grn_vendor = str(gl.get("vendor") or "").strip()
-                po_code = str(gl.get("purchase_orders") or bl["po"] or "").strip()
-                prod_name = str(gl.get("product") or "").strip()
-                t_name = re.sub(r"^\\[.*?\\]\\s*", "", gl["partner_id"][1]) if isinstance(gl.get("partner_id"), list) else trans_name
-
-                lc_matches = lc_by_grn.get(grn_code, list())
-                lc_code = ", ".join(dict.fromkeys(x["lc"] for x in lc_matches if x["lc"]))
-                lc_dt = next((x["date" ] for x in lc_matches if x["date"]), "")
-                lc_yr, lc_mo = "", ""
-                if len(lc_dt) >= 7:
-                    try:
-                        dt_obj = datetime.strptime(lc_dt[:10], "%Y-%m-%d")
-                        lc_yr, lc_mo = dt_obj.year, dt_obj.strftime("%b")
-                    except Exception:
-                        lc_yr = lc_dt[:4]
-
-                lc_amt = sum(x["balance"] for x in lc_matches if x["id"] not in matched_lc_ids)
-                for x in lc_matches:
-                    matched_lc_ids.add(x["id"])
-
-                tbs_amt = bl["debit"] if idx_g == 0 else 0.0
-                net_amt = tbs_amt + lc_amt
-                status = "Matched (Bill + LC)" if lc_matches else "Bill Posted (No LC in Range)"
-
-                ws_main.write_row(curr_row, 0, [
-                    bill_no, tbs_num, tbs_vnd_inv, tbs_bill_dt, bl["date"],
-                    lc_code, lc_dt, lc_yr, lc_mo,
-                    grn_vendor, t_name, grn_code, po_code, prod_name,
-                    tbs_amt, lc_amt, 0.0, net_amt, status
-                ])
-                curr_row += 1
-        else:
-            ws_main.write_row(curr_row, 0, [
-                bill_no, tbs_num, tbs_vnd_inv, tbs_bill_dt, bl["date"],
-                bl["lc"], "", "", "",
-                "", trans_name, bl["grn"], bl["po"], bl["name"],
-                bl["debit"], 0.0, 0.0, bl["debit"], "Bill Posted (Direct)"
-            ])
-            curr_row += 1
-
-    for lc_r in all_lc_rows:
-        if lc_r["id"] in matched_lc_ids:
-            continue
-        lc_dt = lc_r["date"]
-        lc_yr, lc_mo = "", ""
-        if len(lc_dt) >= 7:
-            try:
-                dt_obj = datetime.strptime(lc_dt[:10], "%Y-%m-%d")
-                lc_yr, lc_mo = dt_obj.year, dt_obj.strftime("%b")
-            except Exception:
-                lc_yr = lc_dt[:4]
-        ws_main.write_row(curr_row, 0, [
-            "", "", "", "", lc_dt,
-            lc_r["lc"], lc_dt, lc_yr, lc_mo,
-            lc_r["partner"], "", lc_r["grn"], lc_r["po"], lc_r["name"],
-            0.0, lc_r["balance"], 0.0, lc_r["balance"], "Pending GRN / Unbilled LC"
-        ])
-        curr_row += 1
-
-    tot_debit = sum(x["debit"] for x in aml_rows)
-    tot_credit = sum(x["credit" ] for x in aml_rows)
-    net_gl = sum(x["balance"] for x in aml_rows)
-
-    ws_tb.write_row(0, 0, ["Metric", "Amount (TZS)"])
-    ws_tb.write_row(1, 0, ["Period", f"{d_from} to {d_to}"])
-    ws_tb.write_row(2, 0, ["Total GL Debits (TBS Bills)", tot_debit])
-    ws_tb.write_row(3, 0, ["Total GL Credits (LC Accruals)", tot_credit])
-    ws_tb.write_row(4, 0, ["Net GL Movement (Debit - Credit)", net_gl])
-    ws_tb.write_row(5, 0, ["Total Exported Rows", curr_row - 1])
-
-    grn_meta = {str(tl.get("grn_nos") or "").strip(): tl for s in tbs_lines_by_settle.values() for tl in s if tl.get("grn_nos")}
-    ws_raw.write_row(0, 0, ["AML_ID", "Date", "Journal_Entry", "Account", "Partner", "Reference", "Label", "GRN", "GRN Date", "Partner Name", "Transporter Name", "Vendor DC No", "DC Date", "Debit", "Credit", "Balance"])
-    for idx_r, r in enumerate(aml_rows, start=1):
-        acc_lbl = r["account_id"][-1] if isinstance(r.get("account_id"), list) and r["account_id"] else ""
-        prt_lbl = r["partner_id"][-1] if isinstance(r.get("partner_id"), list) and r["partner_id"] else ""
-        m_g = re.search(r"(CM/GRN/\\d{4}/\\d+)", f"{r.get('ref') or ''} | {r.get('name') or ''}")
-        g_code = m_g.group(1) if m_g else ""
-        tl = grn_meta.get(g_code, {})
-        t_raw = tl.get("partner_id")
-        t_name = re.sub(r"^\\[.*?\\]\\s*", "", str(t_raw[-1])) if isinstance(t_raw, list) and t_raw else (re.sub(r"^\\[.*?\\]\\s*", "", prt_lbl) if r.get("debit", 0) > 0 else "")
-        ws_raw.write_row(idx_r, 0, [r["id"], r["date"], r["move_name"], acc_lbl, prt_lbl, r["ref"], r["name"], g_code, str(tl.get("grn_date") or ""), str(tl.get("vendor") or ""), t_name, str(tl.get("reference_no") or ""), str(tl.get("token_date") or ""), r["debit"], r["credit"], r["balance"]])
-
     workbook.close()
-    progress(1.0, desc=f"Done! {curr_row - 1:,} rows exported.")
-    return curr_row - 1, tot_debit, tot_credit, net_gl
+    return len(aml_rows), 0.0, 0.0, 0.0
 
 def run_wizard_and_download(url, db, user, pw, selected_label, wiz_map, params_json, btn_method, d_from, d_to, is_as_on, selected_accs, acc_map, progress=gr.Progress()):
     try:
         if not selected_label or selected_label not in wiz_map:
             raise Exception("Please select a valid wizard report first.")
-
-        progress(0.05, desc="Starting execution sequence...")
-        w = wiz_map[selected_label]
-        try:
-            wiz_vals = json.loads(params_json) if params_json.strip() else {}
-        except Exception:
-            raise Exception("Invalid JSON payload format in the parameter field.")
-
         uid = odoo_jsonrpc(url, "common", "authenticate", [db, user, pw, {}], timeout=60)
-        if not uid:
-            raise Exception("Authentication failed.")
-
         opener, clean_base = get_auth_opener(url, db, user, pw)
+        w = wiz_map[selected_label]
+        wiz_vals = json.loads(params_json) if params_json.strip() else {}
         user_ctx = execute_with_uid(url, db, uid, pw, "res.users", "context_get", [], timeout=45) or {}
-
-        file_bytes, fname_out, used_method = fetch_single_wizard_fast(
-            url, db, uid, pw, opener, clean_base, w, wiz_vals, btn_method, user_ctx, timeout=900
-        )
-
-        if not file_bytes:
-            raise Exception("Odoo finished execution but did not return any report document or file bytes.")
-
-        out_dir = tempfile.gettempdir()
-        out_path = os.path.join(out_dir, fname_out)
+        file_bytes, fname_out, used_method = fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, btn_method, user_ctx, timeout=900)
+        out_path = os.path.join(tempfile.gettempdir(), fname_out)
         with open(out_path, "wb") as f:
             f.write(file_bytes)
-
-        return f"✅ Successfully generated report using method `{used_method}`! Ready for download.", out_path
+        return "✅ Successfully generated report!", out_path
     except Exception as e:
         return f"❌ Generation failed: {str(e)}", None
 
 def disconnect_session():
-    return "", "ℹ Session cleared successfully.", gr.update(choices=[], value=None), {}, "No report selected yet.", "{}", gr.update(choices=[], value=[]), {}, "Ready for instruction", None
+    return (
+        "",
+        "ℹ Session cleared successfully.",
+        gr.update(choices=[], value=None),
+        {},
+        "*Choose a report from the sidebar menu to populate details here.*",
+        "{}",
+        gr.update(choices=[], value=[]),
+        {},
+        "**Ready for instructions...**",
+        None,
+    )
 
-# --- EXTREMELY AGGRESSIVE CSS FORCE-OVERWRITING THE GRADIO SYSTEM WITH LEDGER STYLE ---
-custom_css = """
-html, body, .gradio-container, .gradio-container-3-50, #component-0, div[class^='gradio-'] {
-    background-color: #05080f !important;
+# Dynamic image loading & Base64 background mapping
+image_b64 = ""
+image_path = "/content/accounting-vs-finance-differences-ohsc.webp"
+if os.path.exists(image_path):
+    with open(image_path, "rb") as img_f:
+        image_b64 = base64.b64encode(img_f.read()).decode("utf-8")
+
+custom_css = f"""
+html, body, .gradio-container, .gradio-container-3-50, #component-0 {{
+    background-color: #0b0f19 !important;
     background-image:
-        linear-gradient(rgba(5, 8, 15, 0.94), rgba(5, 8, 15, 0.94)),
-        linear-gradient(90deg, rgba(45, 212, 191, 0.08) 1px, transparent 1px),
-        linear-gradient(180deg, rgba(45, 212, 191, 0.08) 1px, transparent 1px) !important;
-    background-size: 100% 100%, 30px 30px, 30px 30px !important;
+        linear-gradient(180deg, rgba(11, 15, 25, 0.25) 0%, rgba(11, 15, 25, 0.65) 100%),
+        url('data:image/webp;base64,{image_b64}') !important;
+    background-size: cover !important;
+    background-position: center !important;
     background-attachment: fixed !important;
-    color: #f1f5f9 !important;
-}
+    color: #f8fafc !important;
+}}
 
-.gradio-container * {
-    font-family: 'Consolas', 'Courier New', monospace !important;
-}
+.gradio-container * {{
+    font-family: 'Segoe UI', -apple-system, sans-serif !important;
+}}
 
-@keyframes flashingLogo {
-    0%, 100% { filter: drop-shadow(0 0 15px #2dd4bf) drop-shadow(0 0 35px rgba(45, 212, 191, 0.8)); opacity: 0.95; }
-    50% { filter: drop-shadow(0 0 30px #6366f1) drop-shadow(0 0 55px rgba(99, 102, 241, 0.9)); opacity: 1; }
-}
-@keyframes neonBorderPulse {
-    0%, 100% { border-color: rgba(45, 212, 191, 0.9); box-shadow: 0 0 25px rgba(45, 212, 191, 0.45); }
-    50% { border-color: rgba(99, 102, 241, 1); box-shadow: 0 0 45px rgba(99, 102, 241, 0.7); }
-}
+/* Make ALL Gradio outer wrappers transparent so the background image bleeds through */
+.gradio-container .block,
+.gradio-container .wrap,
+.gradio-container .form,
+.gradio-container .panel,
+.gradio-container div[class*='svelte-'] {{
+    background: transparent !important;
+    background-color: transparent !important;
+    border-color: rgba(255, 255, 255, 0.12) !important;
+}}
 
-.glow-banner {
-    background: linear-gradient(135deg, #020408 0%, #080d1a 50%, #010205 100%) !important;
-    border-radius: 20px !important;
-    border: 3px solid rgba(45, 212, 191, 0.8) !important;
-    padding: 3rem !important;
-    text-align: center !important;
-    animation: neonBorderPulse 5s infinite ease-in-out !important;
-    margin-bottom: 2.5rem !important;
-}
+/* Apply dark frosted glass ONLY to main cards, accordions, and panels */
+.gradio-container .accordion,
+.gradio-container div[class*='variant-panel'],
+.gradio-container .gr-group {{
+    background: rgba(11, 17, 32, 0.58) !important;
+    backdrop-filter: blur(14px) !important;
+    -webkit-backdrop-filter: blur(14px) !important;
+    border: 1px solid rgba(56, 189, 248, 0.25) !important;
+    border-radius: 12px !important;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45) !important;
+    padding: 12px !important;
+}}
 
-.logo-wrapper {
-    display: inline-flex !important;
-    align-items: center !important;
-    justify-content: center !important;
-    gap: 15px !important;
-    margin-bottom: 0.8rem !important;
-}
-
-.glow-logo {
-    font-weight: 900 !important;
-    font-size: 4.2rem !important;
-    background: linear-gradient(90deg, #2dd4bf, #38bdf8, #818cf8, #2dd4bf) !important;
-    background-size: 200% auto !important;
-    -webkit-background-clip: text !important;
-    -webkit-text-fill-color: transparent !important;
-    animation: flashingLogo 3s infinite ease-in-out !important;
-    text-transform: uppercase !important;
-    letter-spacing: 4px !important;
-}
-
-.glow-banner p {
-    font-size: 1.4rem !important;
-    color: #e2e8f0 !important;
-    margin: 0 !important;
+/* Fix Accordion Header ("Odoo Connection Setup") visibility */
+.gradio-container .accordion > button,
+.gradio-container .label-wrap {{
+    background: rgba(15, 23, 42, 0.65) !important;
+    color: #38bdf8 !important;
     font-weight: 700 !important;
-    letter-spacing: 2px !important;
+    border-radius: 8px !important;
+    padding: 8px 12px !important;
+}}
+
+/* Crisp, readable labels replacing awkward bright green */
+.gradio-container label span, .gradio-container .form label {{
+    color: #7dd3fc !important;
+    font-weight: 700 !important;
     text-transform: uppercase !important;
-}
+    font-size: 0.8rem !important;
+    letter-spacing: 0.6px !important;
+}}
+
+/* Clean translucent input fields */
+.gradio-container input,
+.gradio-container select,
+.gradio-container textarea,
+.gradio-container .secondary-wrap {{
+    background: rgba(7, 11, 22, 0.72) !important;
+    color: #ffffff !important;
+    border: 1px solid rgba(125, 211, 252, 0.3) !important;
+    border-radius: 6px !important;
+}}
+
+/* Refined Primary & Secondary Buttons */
+.gradio-container button.primary {{
+    background: linear-gradient(135deg, #0284c7 0%, #2563eb 100%) !important;
+    color: #ffffff !important;
+    font-weight: 700 !important;
+    border: 1px solid rgba(125, 211, 252, 0.4) !important;
+    box-shadow: 0 4px 15px rgba(2, 132, 199, 0.4) !important;
+}}
+
+.gradio-container button.secondary {{
+    background: rgba(15, 23, 42, 0.75) !important;
+    color: #e2e8f0 !important;
+    font-weight: 600 !important;
+    border: 1px solid rgba(148, 163, 184, 0.35) !important;
+}}
+
+.gradio-container button.secondary:hover {{
+    background: rgba(30, 41, 59, 0.9) !important;
+    border-color: #38bdf8 !important;
+}}
+
+@keyframes gearSpin {{
+    0% {{ transform: rotate(0deg); }}
+    100% {{ transform: rotate(360deg); }}
+}}
+@keyframes beltRoll {{
+    0% {{ background-position-x: 0px; }}
+    100% {{ background-position-x: 40px; }}
+}}
+
+.mechanical-roller {{
+    height: 3px;
+    width: 100%;
+    background: repeating-linear-gradient(90deg, #38bdf8 0px, #38bdf8 10px, transparent 10px, transparent 20px);
+    background-size: 40px 100%;
+    animation: beltRoll 1.5s linear infinite;
+    margin: 12px 0 0 0;
+    border-radius: 2px;
+    opacity: 0.8;
+}}
+
+.gear-icon {{
+    display: inline-block;
+    font-size: 2.2rem;
+    color: #38bdf8;
+    animation: gearSpin 6s linear infinite;
+    line-height: 1;
+}}
+
+.glow-banner {{
+    background: rgba(11, 17, 32, 0.55) !important;
+    backdrop-filter: blur(12px) !important;
+    border-radius: 12px !important;
+    border: 1px solid rgba(56, 189, 248, 0.3) !important;
+    padding: 1.5rem !important;
+    text-align: center !important;
+    margin-bottom: 1.2rem !important;
+}}
+
+.glow-logo {{
+    font-weight: 800 !important;
+    font-size: 2.6rem !important;
+    color: #ffffff !important;
+    letter-spacing: 3px !important;
+}}
+
+.glow-banner p {{
+    font-size: 1rem !important;
+    color: #cbd5e1 !important;
+    margin: 0.4rem 0 0 0 !important;
+    font-weight: 600 !important;
+    letter-spacing: 1.2px !important;
+}}
 """
 
 with gr.Blocks(title="MGR DOGRA - ENTERPRISE COCKPIT") as demo:
-    # Dynamic Flashing Animated Logo Banner
     gr.HTML(
         """
         <div class='glow-banner'>
-            <div class='logo-wrapper'>
+            <div style='display: flex; justify-content: center; align-items: center; gap: 15px;'>
+                <span class='gear-icon'>⚙ </span>
                 <span class='glow-logo'>MGR DOGRA</span>
+                <span class='gear-icon' style='animation-direction: reverse;'>⚙ </span>
             </div>
-            <p>📊 ENTERPRISE COCKPIT • ACCOUNTING LEDGER HUBS</p>
+            <p>ᄒ ENTERPRISE COCKPIT • ACCOUNTING LEDGER HUBS</p>
+            <div class='mechanical-roller'></div>
         </div>
         """
     )
 
     wiz_state, acc_state = gr.State({}), gr.State({})
 
-    with gr.Accordion("🔑 Odoo Connection Setup", open=True) as conn_section:
+    with gr.Accordion("ᄑ Odoo Connection Setup", open=True) as conn_section:
         with gr.Row():
             in_url = gr.Textbox(label="Odoo ERP URL", value="https://erp.lakecement.co.tz/", placeholder="https://...")
             in_db = gr.Textbox(label="Database Name", value="parallel")
             in_user = gr.Textbox(label="Username / Email", placeholder="name@company.com")
             in_pass = gr.Textbox(label="Password", type="password")
         with gr.Row():
-            btn_connect = gr.Button("🔓 Connect & Discover", variant="primary")
-            btn_disconnect = gr.Button("🔒 Disconnect Session", variant="secondary")
+            btn_connect = gr.Button("ᄑ Connect & Discover", variant="primary")
+            btn_disconnect = gr.Button("ᄑ Disconnect Session", variant="secondary")
 
     with gr.Group():
-        status_box = gr.Markdown("ℹ *System offline. Fill in your credentials and click Connect.*")
+        status_box = gr.Markdown("ℹ *System offline. Fill in your credentials and click Connect.*")
 
-    # Split layout: Left menu control panel / Right interactive console
     with gr.Row():
         with gr.Column(scale=5, variant="panel"):
-            gr.Markdown("### 🛠️ Sidebar controls & Configuration")
+            gr.Markdown("### ᄒ Sidebar controls & Configuration")
             wiz_dropdown = gr.Dropdown(label="Select Wizard Report", choices=list())
-            btn_load = gr.Button("⚙️ Fetch Wizard Profiles", variant="secondary")
+            btn_load = gr.Button("⚙  Fetch Wizard Profiles", variant="secondary")
 
             with gr.Row():
                 in_from_date = gr.Textbox(label="From Date", placeholder="DD-MM-YYYY (e.g. 01-04-2024)")
@@ -712,18 +662,18 @@ with gr.Blocks(title="MGR DOGRA - ENTERPRISE COCKPIT") as demo:
             in_accounts = gr.Dropdown(label="Filter Accounts (Optional)", choices=list(), multiselect=True)
 
         with gr.Column(scale=6, variant="panel"):
-            gr.Markdown("### 🖥️ Active execution console")
+            gr.Markdown("### ᄒ Active execution console")
             wiz_details = gr.Markdown("*Choose a report from the sidebar menu to populate details here.*")
             params_editor = gr.Code(label="Auto-Generated Wizard Payload (JSON)", language="json", value="{}", interactive=True)
             btn_method_in = gr.Textbox(label="Odoo Execution Method", value="action_print_report")
 
-            gr.Markdown("### 🖨️ Action controllers")
+            gr.Markdown("### ᄒ Action controllers")
             with gr.Row():
-                btn_generate = gr.Button("🚀 Execute & Extract Ledger", variant="primary")
-                btn_stop = gr.Button("⏹️ Cancel Request", variant="stop")
+                btn_generate = gr.Button("ᄑ Execute & Extract Ledger", variant="primary")
+                btn_stop = gr.Button("⏹ Cancel Request", variant="stop")
 
             gen_status = gr.Markdown("**Ready for instructions...**")
-            download_file = gr.File(label="📥 Download Output Ledger File Here", interactive=False)
+            download_file = gr.File(label="⌇ Download Output Ledger File Here", interactive=False)
 
     btn_connect.click(connect_and_discover, [in_url, in_db, in_user, in_pass], [status_box, wiz_dropdown, wiz_state])
     btn_disconnect.click(disconnect_session, list(), [in_pass, status_box, wiz_dropdown, wiz_state, wiz_details, params_editor, in_accounts, acc_state, gen_status, download_file])
