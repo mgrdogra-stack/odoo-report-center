@@ -439,16 +439,26 @@ def run_wizard_and_download(url, db, user, pw, selected_label, wiz_map, params_j
     try:
         if not selected_label or selected_label not in wiz_map:
             raise Exception("Please select a valid wizard report first.")
+
+        progress(0.10, desc="Authenticating with Odoo...")
         uid = odoo_jsonrpc(url, "common", "authenticate", [db, user, pw, {}], timeout=60)
         opener, clean_base = get_auth_opener(url, db, user, pw)
+
+        progress(0.30, desc="Loading wizard context & parameters...")
         w = wiz_map[selected_label]
         wiz_vals = json.loads(params_json) if params_json.strip() else {}
         user_ctx = execute_with_uid(url, db, uid, pw, "res.users", "context_get", [], timeout=45) or {}
+
+        progress(0.55, desc=f"Executing '{w['name']}' on Odoo server (please wait)...")
         file_bytes, fname_out, used_method = fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, btn_method, user_ctx, timeout=900)
+
+        progress(0.90, desc="Downloading & saving report file...")
         out_path = os.path.join(tempfile.gettempdir(), fname_out)
         with open(out_path, "wb") as f:
             f.write(file_bytes)
-        return "✅ Successfully generated report!", out_path
+
+        progress(1.0, desc="Done!")
+        return f"✅ Successfully generated report ({fname_out})!", out_path
     except Exception as e:
         return f"❌ Generation failed: {str(e)}", None
 
@@ -494,6 +504,24 @@ html, body, .gradio-container, .gradio-container-3-50, #component-0 {{
 }}
 
 /* Make ALL Gradio outer wrappers transparent so the background image bleeds through */
+/* Make Gradio's Progress Bar & Loading Overlay clearly visible */
+.gradio-container .wrap.default,
+.gradio-container .progress-bar-wrap,
+.gradio-container .toast-wrap {{
+    background: rgba(15, 18, 28, 0.92) !important;
+    backdrop-filter: blur(10px) !important;
+    border: 1px solid rgba(251, 191, 36, 0.5) !important;
+    border-radius: 8px !important;
+    color: #ffffff !important;
+    z-index: 9999 !important;
+}}
+
+.gradio-container .progress-bar {{
+    background: linear-gradient(90deg, #d97706, #fbbf24) !important;
+    height: 8px !important;
+    border-radius: 4px !important;
+}}
+
 .gradio-container .block,
 .gradio-container .wrap,
 .gradio-container .form,
