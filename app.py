@@ -1,3 +1,5 @@
+import os
+
 import gradio as gr
 import urllib.request, urllib.error, http.cookiejar, json, base64, tempfile, os
 import xml.etree.ElementTree as ET
@@ -1198,9 +1200,7 @@ with gr.Blocks(title="Odoo Report & Ledger Center - MGR Dogra") as demo:
     btn_stop.click(stop_generation, list(), [gen_status], cancels=[gen_event])
 
 gr.close_all()
-print(f"✅ Local URL: {local_url}", flush=True)
-print(f"🌍 Public URL: {share_url}", flush=True)
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 7860))
+    port = int(os.environ.get("PORT", 10000))
     demo.launch(server_name="0.0.0.0", server_port=port, share=False)
