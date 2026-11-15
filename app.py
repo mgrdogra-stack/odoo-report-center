@@ -503,8 +503,7 @@ html, body, .gradio-container, .gradio-container-3-50, #component-0 {{
     font-family: 'Segoe UI', -apple-system, sans-serif !important;
 }}
 
-/* Make ALL Gradio outer wrappers transparent so the background image bleeds through */
-/* Make Gradio's Progress Bar & Loading Overlay clearly visible */
+/* Make Gradio's Progress Bar & Loading Overlay clearly visible with Amber fill */
 .gradio-container .wrap.default,
 .gradio-container .progress-bar-wrap,
 .gradio-container .toast-wrap {{
@@ -516,10 +515,31 @@ html, body, .gradio-container, .gradio-container-3-50, #component-0 {{
     z-index: 9999 !important;
 }}
 
-.gradio-container .progress-bar {{
-    background: linear-gradient(90deg, #d97706, #fbbf24) !important;
-    height: 8px !important;
-    border-radius: 4px !important;
+/* Dark background track behind the moving bar */
+.gradio-container .progress-level {{
+    background: rgba(30, 41, 59, 0.85) !important;
+    border-radius: 6px !important;
+    overflow: hidden !important;
+    height: 10px !important;
+    border: 1px solid rgba(251, 191, 36, 0.3) !important;
+}}
+
+/* The actual moving progress bar fill in glowing Amber/Gold */
+.gradio-container .progress-level-inner,
+.gradio-container .progress-bar,
+.gradio-container progress::-webkit-progress-value {{
+    background: linear-gradient(90deg, #d97706 0%, #f59e0b 50%, #fde047 100%) !important;
+    background-color: #f59e0b !important;
+    box-shadow: 0 0 10px rgba(245, 158, 11, 0.75) !important;
+    height: 100% !important;
+    transition: width 0.3s ease !important;
+}}
+
+/* Percentage & status text inside the progress overlay */
+.gradio-container .progress-text,
+.gradio-container .meta-text {{
+    color: #fcd34d !important;
+    font-weight: 700 !important;
 }}
 
 .gradio-container .block,
