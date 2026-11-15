@@ -605,56 +605,59 @@ def disconnect_session():
 
 # --- Styled Dynamic Theme block with flashing/glow animated logo & modern banner ---
 custom_css = """
-body {
-    background-color: #0b0f19;
+html, body, .gradio-container {
+    background-color: #0b111e !important;
     background-image:
-        linear-gradient(rgba(13, 22, 38, 0.95), rgba(11, 15, 25, 0.98)),
-        linear-gradient(to right, rgba(45, 212, 191, 0.04) 1px, transparent 1px),
-        linear-gradient(to bottom, rgba(45, 212, 191, 0.04) 1px, transparent 1px);
-    background-size: 100% 100%, 40px 40px, 40px 40px;
-    background-attachment: fixed;
+        radial-gradient(at 0% 0%, rgba(45, 212, 191, 0.1) 0, transparent 40%),
+        radial-gradient(at 100% 100%, rgba(99, 102, 241, 0.1) 0, transparent 40%),
+        linear-gradient(to right, rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+        linear-gradient(to bottom, rgba(255, 255, 255, 0.03) 1px, transparent 1px) !important;
+    background-size: 100% 100%, 100% 100%, 35px 35px, 35px 35px !important;
+    color: #f1f5f9 !important;
 }
+
 @keyframes flashingLogo {
-    0%, 100% { filter: drop-shadow(0 0 5px #2dd4bf) drop-shadow(0 0 15px #2dd4bf); opacity: 0.9; }
-    50% { filter: drop-shadow(0 0 20px #6366f1) drop-shadow(0 0 35px #6366f1); opacity: 1; }
+    0%, 100% { filter: drop-shadow(0 0 10px #2dd4bf) drop-shadow(0 0 25px rgba(45, 212, 191, 0.6)); opacity: 0.95; }
+    50% { filter: drop-shadow(0 0 25px #6366f1) drop-shadow(0 0 45px rgba(99, 102, 241, 0.8)); opacity: 1; }
 }
 @keyframes neonBorderPulse {
-    0%, 100% { border-color: rgba(45, 212, 191, 0.4); box-shadow: 0 0 15px rgba(45, 212, 191, 0.2); }
-    50% { border-color: rgba(99, 102, 241, 0.8); box-shadow: 0 0 25px rgba(99, 102, 241, 0.4); }
+    0%, 100% { border-color: rgba(45, 212, 191, 0.6); box-shadow: 0 0 20px rgba(45, 212, 191, 0.25); }
+    50% { border-color: rgba(99, 102, 241, 0.9); box-shadow: 0 0 35px rgba(99, 102, 241, 0.5); }
 }
 .glow-banner {
-    background: linear-gradient(135deg, #0d1626 0%, #111827 50%, #030712 100%);
-    border-radius: 16px;
-    border: 2px solid rgba(45, 212, 191, 0.4);
-    padding: 2.2rem;
+    background: linear-gradient(135deg, #090f1c 0%, #111a2e 50%, #050a14 100%);
+    border-radius: 18px;
+    border: 2px solid rgba(45, 212, 191, 0.6);
+    padding: 2.5rem;
     text-align: center;
-    animation: neonBorderPulse 6s infinite ease-in-out;
-    margin-bottom: 1.5rem;
+    animation: neonBorderPulse 5s infinite ease-in-out;
+    margin-bottom: 2rem;
 }
 .logo-wrapper {
     display: inline-flex;
     align-items: center;
     justify-content: center;
     gap: 15px;
-    margin-bottom: 0.5rem;
+    margin-bottom: 0.6rem;
 }
 .glow-logo {
     font-family: 'Courier New', Courier, monospace;
     font-weight: 900 !important;
-    font-size: 3.5rem !important;
+    font-size: 3.8rem !important;
     background: linear-gradient(90deg, #2dd4bf, #38bdf8, #6366f1, #2dd4bf);
-    background-size: 300% auto;
+    background-size: 200% auto;
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
     animation: flashingLogo 3s infinite ease-in-out;
     text-transform: uppercase;
-    letter-spacing: 2px;
+    letter-spacing: 3px;
 }
 .glow-banner p {
-    font-size: 1.1rem;
-    color: #94a3b8;
+    font-size: 1.25rem;
+    color: #cbd5e1;
     margin: 0;
-    font-weight: 500;
+    font-weight: 600;
+    letter-spacing: 1px;
 }
 """
 
