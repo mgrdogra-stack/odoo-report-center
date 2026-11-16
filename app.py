@@ -735,22 +735,14 @@ with gr.Blocks(title="MGR DOGRA - ENTERPRISE COCKPIT") as demo:
     gen_event = btn_generate.click(run_wizard_and_download, [in_url, in_db, in_user, in_pass, wiz_dropdown, wiz_state, params_editor, btn_method_in], [gen_status, download_file])
     btn_stop.click(stop_generation, list(), [gen_status], cancels=[gen_event])
 
-# COLAB_ONLY
 import os, subprocess
 os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
 
 subprocess.run(["pkill", "-f", "frpc"], check=False)
 gr.close_all()
 
-    share=True,
-    inline=False,
-    allowed_paths=["/content", "."],
-    debug=False,
-    prevent_thread_lock=True,
-    max_threads=40,
-    theme=gr.themes.Soft(primary_hue="amber", secondary_hue="slate"),
-    css=custom_css,
-)
+
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
@@ -758,6 +750,7 @@ if __name__ == "__main__":
         server_name="0.0.0.0",
         server_port=port,
         share=False,
+        allowed_paths=["."],
         theme=gr.themes.Soft(primary_hue="amber", secondary_hue="stone"),
         css=custom_css,
     )
