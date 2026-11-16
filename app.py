@@ -363,78 +363,6 @@ def rpc_fetch_all(url, db, uid, pw, model, domain, fields, batch_size=2000, prog
         offset += len(chunk)
     return out
 
-def extract_grir_transport_fast(url, db, uid, pw, acc_ids, d_from, d_to, out_xlsx_path, progress):
-    d1_str = to_odoo_date(d_from)
-    d2_str = to_odoo_date(d_to)
-    dom = [["parent_state", "=", "posted"], ["date", ">=", d1_str], ["date", "<=", d2_str]]
-    if acc_ids:
-        dom.append(["account_id", "in", acc_ids])
-    else:
-        dom.extend([["account_id.name", "ilike", "GRIR"], ["account_id.name", "ilike", "TRANSPORT"]])
-
-    progress(0.08, desc="Fetching posted GRIR Transport ledger items...")
-    aml_fields = ["id", "date", "move_id", "move_name", "ref", "name", "po_ref", "partner_id", "account_id", "debit", "credit", "balance"]
-    aml_rows = rpc_fetch_all(url, db, uid, pw, "account.move.line", dom, aml_fields, 2500, progress, "GRIR Ledger Lines", 0.10, 0.45)
-
-    if not aml_rows:
-        return 0, 0.0, 0.0, 0.0
-
-    lc_by_grn = {}
-    all_lc_rows = list()
-    bill_move_ids = set()
-    bill_lines = list()
-
-    for r in aml_rows:
-        ref_txt = str(r.get("ref") or "")
-        name_txt = str(r.get("name") or "")
-        combo = f"{ref_txt} | {name_txt}"
-        m_lc = re.search(r"(LC/\d{4}/\d+)", combo)
-        m_grn = re.search(r"(CM/GRN/\d{4}/\d+)", combo)
-        m_po = re.search(r"([A-Z]+ORD/\d{4}/\d+)", combo)
-        lc_no = m_lc.group(1) if m_lc else ""
-        grn_no = m_grn.group(1) if m_grn else ""
-        po_no = m_po.group(1) if m_po else str(r.get("po_ref") or "")
-        p_name = r["partner_id"][1] if isinstance(r.get("partner_id"), list) else ""
-        p_clean = re.sub(r"^\[.*?\].*", "", p_name)
-
-        entry = {
-            "id": r["id"],
-            "date": str(r.get("date") or ""),
-            "move_id": r["move_id"],
-            "move_name": str(r.get("move_name") or ""),
-            "ref": ref_txt,
-            "name": name_txt,
-            "lc": lc_no,
-            "grn": grn_no,
-            "po": po_no,
-            "partner": p_clean,
-            "debit": float(r.get("debit") or 0.0),
-            "credit": float(r.get("credit") or 0.0),
-            "balance": float(r.get("balance") or 0.0),
-        }
-        if entry["debit"] > 0 and entry["move_id"]:
-            bill_move_ids.add(entry["move_id"].get(0) if isinstance(entry["move_id"], list) else entry["move_id"])
-            bill_lines.append(entry)
-        else:
-            all_lc_rows.append(entry)
-            if grn_no:
-                lc_by_grn.setdefault(grn_no, list()).append(entry)
-
-    progress(0.50, desc="Linking bills...")
-    move_map = {}
-    tbs_ids = set()
-    m_id_list = list(bill_move_ids)
-    for i in range(0, len(m_id_list), 2000):
-        batch_ids = m_id_list[i:i+2000]
-        m_recs = execute_with_uid(url, db, uid, pw, "account.move", "read", [batch_ids], {"fields": ["id", "name", "ref", "invoice_date", "invoice_origin", "tbill_purchase_id", "partner_id"]}, timeout=180)
-        for m in m_recs:
-            move_map[m["id"]] = m
-
-    workbook = xlsxwriter.Workbook(out_xlsx_path, {"constant_memory": True})
-    ws_main = workbook.add_worksheet("GRIR_Transport_Breakup")
-    workbook.close()
-    return len(aml_rows), 0.0, 0.0, 0.0
-
 def run_wizard_and_download(url, db, user, pw, selected_label, wiz_map, params_json, btn_method, d_from, d_to, is_as_on, selected_accs, acc_map, progress=gr.Progress()):
     try:
         if not selected_label or selected_label not in wiz_map:
@@ -476,198 +404,158 @@ def disconnect_session():
         None,
     )
 
-# Dynamic image loading & Base64 background mapping
-image_b64 = ""
-for candidate_path in [
-    "accounting-vs-finance-differences-ohsc.webp",
-    "/content/accounting-vs-finance-differences-ohsc.webp",
-]:
-    if os.path.exists(candidate_path):
-        with open(candidate_path, "rb") as img_f:
-            image_b64 = base64.b64encode(img_f.read()).decode("utf-8")
-        break
-
-custom_css = f"""
-html, body, .gradio-container, .gradio-container-3-50, #component-0 {{
+custom_css = """
+html, body, .gradio-container, .gradio-container-3-50, #component-0 {
     background-color: #0b0f19 !important;
     background-image:
-        linear-gradient(180deg, rgba(11, 15, 25, 0.25) 0%, rgba(11, 15, 25, 0.65) 100%),
-        url('data:image/webp;base64,{image_b64}') !important;
+        linear-gradient(180deg, rgba(11, 15, 25, 0.55) 0%, rgba(11, 15, 25, 0.85) 100%),
+        url('/file=accounting-vs-finance-differences-ohsc.webp') !important;
     background-size: cover !important;
     background-position: center !important;
-    background-attachment: fixed !important;
     color: #f8fafc !important;
-}}
+}
 
-.gradio-container * {{
+.gradio-container * {
     font-family: 'Segoe UI', -apple-system, sans-serif !important;
-}}
+}
 
-/* Make Gradio's Progress Bar & Loading Overlay clearly visible with Amber fill */
 .gradio-container .wrap.default,
 .gradio-container .progress-bar-wrap,
-.gradio-container .toast-wrap {{
-    background: rgba(15, 18, 28, 0.92) !important;
-    backdrop-filter: blur(10px) !important;
+.gradio-container .toast-wrap {
+    background: rgba(15, 18, 28, 0.94) !important;
     border: 1px solid rgba(251, 191, 36, 0.5) !important;
     border-radius: 8px !important;
     color: #ffffff !important;
     z-index: 9999 !important;
-}}
+}
 
-/* Dark background track behind the moving bar */
-.gradio-container .progress-level {{
+.gradio-container .progress-level {
     background: rgba(30, 41, 59, 0.85) !important;
     border-radius: 6px !important;
     overflow: hidden !important;
     height: 10px !important;
     border: 1px solid rgba(251, 191, 36, 0.3) !important;
-}}
+}
 
-/* The actual moving progress bar fill in glowing Amber/Gold */
 .gradio-container .progress-level-inner,
 .gradio-container .progress-bar,
-.gradio-container progress::-webkit-progress-value {{
+.gradio-container progress::-webkit-progress-value {
     background: linear-gradient(90deg, #d97706 0%, #f59e0b 50%, #fde047 100%) !important;
     background-color: #f59e0b !important;
-    box-shadow: 0 0 10px rgba(245, 158, 11, 0.75) !important;
     height: 100% !important;
-    transition: width 0.3s ease !important;
-}}
+}
 
-/* Percentage & status text inside the progress overlay */
 .gradio-container .progress-text,
-.gradio-container .meta-text {{
+.gradio-container .meta-text {
     color: #fcd34d !important;
     font-weight: 700 !important;
-}}
+}
 
 .gradio-container .block,
 .gradio-container .wrap,
 .gradio-container .form,
 .gradio-container .panel,
-.gradio-container div[class*='svelte-'] {{
+.gradio-container div[class*='svelte-'] {
     background: transparent !important;
     background-color: transparent !important;
     border-color: rgba(255, 255, 255, 0.12) !important;
-}}
+}
 
-/* Apply dark frosted glass ONLY to main cards, accordions, and panels */
 .gradio-container .accordion,
 .gradio-container div[class*='variant-panel'],
-.gradio-container .gr-group {{
-    background: rgba(11, 17, 32, 0.58) !important;
-    backdrop-filter: blur(14px) !important;
-    -webkit-backdrop-filter: blur(14px) !important;
+.gradio-container .gr-group {
+    background: rgba(11, 17, 32, 0.86) !important;
     border: 1px solid rgba(56, 189, 248, 0.25) !important;
     border-radius: 12px !important;
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45) !important;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4) !important;
     padding: 12px !important;
-}}
+}
 
-/* Fix Accordion Header ("Odoo Connection Setup") visibility */
 .gradio-container .accordion > button,
-.gradio-container .label-wrap {{
-    background: rgba(15, 23, 42, 0.65) !important;
+.gradio-container .label-wrap {
+    background: rgba(15, 23, 42, 0.85) !important;
     color: #38bdf8 !important;
     font-weight: 700 !important;
     border-radius: 8px !important;
     padding: 8px 12px !important;
-}}
+}
 
-/* Crisp, readable labels replacing awkward bright green */
-.gradio-container label span, .gradio-container .form label {{
+.gradio-container label span, .gradio-container .form label {
     color: #7dd3fc !important;
     font-weight: 700 !important;
     text-transform: uppercase !important;
     font-size: 0.8rem !important;
     letter-spacing: 0.6px !important;
-}}
+}
 
-/* Clean translucent input fields */
 .gradio-container input,
 .gradio-container select,
 .gradio-container textarea,
-.gradio-container .secondary-wrap {{
-    background: rgba(7, 11, 22, 0.72) !important;
+.gradio-container .secondary-wrap {
+    background: rgba(7, 11, 22, 0.85) !important;
     color: #ffffff !important;
     border: 1px solid rgba(125, 211, 252, 0.3) !important;
     border-radius: 6px !important;
-}}
+}
 
-/* Refined Primary & Secondary Buttons */
-.gradio-container button.primary {{
+.gradio-container button.primary {
     background: linear-gradient(135deg, #0284c7 0%, #2563eb 100%) !important;
     color: #ffffff !important;
     font-weight: 700 !important;
     border: 1px solid rgba(125, 211, 252, 0.4) !important;
-    box-shadow: 0 4px 15px rgba(2, 132, 199, 0.4) !important;
-}}
+}
 
-.gradio-container button.secondary {{
-    background: rgba(15, 23, 42, 0.75) !important;
+.gradio-container button.secondary {
+    background: rgba(15, 23, 42, 0.85) !important;
     color: #e2e8f0 !important;
     font-weight: 600 !important;
     border: 1px solid rgba(148, 163, 184, 0.35) !important;
-}}
+}
 
-.gradio-container button.secondary:hover {{
-    background: rgba(30, 41, 59, 0.9) !important;
+.gradio-container button.secondary:hover {
+    background: rgba(30, 41, 59, 0.95) !important;
     border-color: #38bdf8 !important;
-}}
+}
 
-@keyframes gearSpin {{
-    0% {{ transform: rotate(0deg); }}
-    100% {{ transform: rotate(360deg); }}
-}}
-@keyframes beltRoll {{
-    0% {{ background-position-x: 0px; }}
-    100% {{ background-position-x: 40px; }}
-}}
-
-.mechanical-roller {{
+.mechanical-roller {
     height: 3px;
     width: 100%;
     background: repeating-linear-gradient(90deg, #38bdf8 0px, #38bdf8 10px, transparent 10px, transparent 20px);
-    background-size: 40px 100%;
-    animation: beltRoll 1.5s linear infinite;
     margin: 12px 0 0 0;
     border-radius: 2px;
     opacity: 0.8;
-}}
+}
 
-.gear-icon {{
+.gear-icon {
     display: inline-block;
     font-size: 2.2rem;
     color: #38bdf8;
-    animation: gearSpin 6s linear infinite;
     line-height: 1;
-}}
+}
 
-.glow-banner {{
-    background: rgba(11, 17, 32, 0.55) !important;
-    backdrop-filter: blur(12px) !important;
+.glow-banner {
+    background: rgba(11, 17, 32, 0.86) !important;
     border-radius: 12px !important;
     border: 1px solid rgba(56, 189, 248, 0.3) !important;
     padding: 1.5rem !important;
     text-align: center !important;
     margin-bottom: 1.2rem !important;
-}}
+}
 
-.glow-logo {{
+.glow-logo {
     font-weight: 800 !important;
     font-size: 2.6rem !important;
     color: #ffffff !important;
     letter-spacing: 3px !important;
-}}
+}
 
-.glow-banner p {{
+.glow-banner p {
     font-size: 1rem !important;
     color: #cbd5e1 !important;
     margin: 0.4rem 0 0 0 !important;
     font-weight: 600 !important;
     letter-spacing: 1.2px !important;
-}}
+}
 """
 
 with gr.Blocks(title="MGR DOGRA - ENTERPRISE COCKPIT") as demo:
@@ -675,11 +563,11 @@ with gr.Blocks(title="MGR DOGRA - ENTERPRISE COCKPIT") as demo:
         """
         <div class='glow-banner'>
             <div style='display: flex; justify-content: center; align-items: center; gap: 15px;'>
-                <span class='gear-icon'>⚙ </span>
+                <span class='gear-icon'>⚙</span>
                 <span class='glow-logo'>MGR DOGRA</span>
-                <span class='gear-icon' style='animation-direction: reverse;'>⚙ </span>
+                <span class='gear-icon'>⚙</span>
             </div>
-            <p>ᄒ ENTERPRISE COCKPIT • ACCOUNTING LEDGER HUBS</p>
+            <p>ENTERPRISE COCKPIT • ACCOUNTING LEDGER HUBS</p>
             <div class='mechanical-roller'></div>
         </div>
         """
@@ -687,24 +575,24 @@ with gr.Blocks(title="MGR DOGRA - ENTERPRISE COCKPIT") as demo:
 
     wiz_state, acc_state = gr.State({}), gr.State({})
 
-    with gr.Accordion("ᄑ Odoo Connection Setup", open=True) as conn_section:
+    with gr.Accordion("Odoo Connection Setup", open=True) as conn_section:
         with gr.Row():
             in_url = gr.Textbox(label="Odoo ERP URL", value="https://erp.lakecement.co.tz/", placeholder="https://...")
             in_db = gr.Textbox(label="Database Name", value="parallel")
             in_user = gr.Textbox(label="Username / Email", placeholder="name@company.com")
             in_pass = gr.Textbox(label="Password", type="password")
         with gr.Row():
-            btn_connect = gr.Button("ᄑ Connect & Discover", variant="primary")
-            btn_disconnect = gr.Button("ᄑ Disconnect Session", variant="secondary")
+            btn_connect = gr.Button("Connect & Discover", variant="primary")
+            btn_disconnect = gr.Button("Disconnect Session", variant="secondary")
 
     with gr.Group():
         status_box = gr.Markdown("ℹ *System offline. Fill in your credentials and click Connect.*")
 
     with gr.Row():
         with gr.Column(scale=5, variant="panel"):
-            gr.Markdown("### ᄒ Sidebar controls & Configuration")
+            gr.Markdown("### Sidebar controls & Configuration")
             wiz_dropdown = gr.Dropdown(label="Select Wizard Report", choices=list())
-            btn_load = gr.Button("⚙  Fetch Wizard Profiles", variant="secondary")
+            btn_load = gr.Button("Fetch Wizard Profiles", variant="secondary")
 
             with gr.Row():
                 in_from_date = gr.Textbox(label="From Date", placeholder="DD-MM-YYYY (e.g. 01-04-2024)")
@@ -714,12 +602,12 @@ with gr.Blocks(title="MGR DOGRA - ENTERPRISE COCKPIT") as demo:
             in_accounts = gr.Dropdown(label="Filter Accounts (Optional)", choices=list(), multiselect=True)
 
         with gr.Column(scale=6, variant="panel"):
-            gr.Markdown("### ᄒ Active execution console")
+            gr.Markdown("### Active execution console")
             wiz_details = gr.Markdown("*Choose a report from the sidebar menu to populate details here.*")
             params_editor = gr.Code(label="Auto-Generated Wizard Payload (JSON)", language="json", value="{}", interactive=True)
             btn_method_in = gr.Textbox(label="Odoo Execution Method", value="action_print_report")
 
-            gr.Markdown("### ᄒ Action controllers")
+            gr.Markdown("### Action controllers")
             with gr.Row():
                 btn_generate = gr.Button("ᄑ Execute & Extract Ledger", variant="primary")
                 btn_stop = gr.Button("⏹ Cancel Request", variant="stop")
