@@ -158,13 +158,14 @@ def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
             (start_fields if is_start else end_fields).append((fname, ftype))
             if fname in default_vals and default_vals[fname]:
                 clean_def = to_odoo_date(default_vals[fname])
-                if len(clean_def) >= 10 and clean_def == "-":
+                if len(clean_def) >= 10 and clean_def[4] == "-":
                     default_vals[fname] = f"{clean_def[:10]} 00:00:00" if (ftype == "datetime" and len(clean_def) == 10) else clean_def
                 else:
                     default_vals[fname] = False
             raw_d = to_odoo_date(cur_from) if is_start else to_odoo_date(cur_to)
             if raw_d:
                 default_vals[fname] = f"{raw_d} 00:00:00" if ftype == "datetime" else raw_d
+
 
         elif ftype == "selection" and meta.get("selection") and fname not in default_vals:
             valid = [item for item in meta["selection"] if isinstance(item, (list, tuple)) and len(item) >= 2]
@@ -473,20 +474,26 @@ def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, 
         with opener.open(dl_url, timeout=timeout) as resp:
             return resp.read(), f"{w['name'].replace(' ', '_')}.xlsx", "export_to_xlsx"
 
-    f_info = execute_with_uid(url, db, uid, pw, w["res_model"], "fields_get", [], {"attributes": ["type"]}, timeout=timeout)
+        f_info = execute_with_uid(url, db, uid, pw, w["res_model"], "fields_get", [], {"attributes": ["type", "required"]}, timeout=timeout)
+    today_str = datetime.today().strftime("%Y-%m-%d")
     safe_vals = {}
     for k, v in wiz_vals.items():
         if k not in f_info:
             continue
         ftype = f_info[k].get("type")
-        if ftype in ("date", "datetime") and v:
-            cleaned = to_odoo_date(v)
+        if ftype in ("date", "datetime"):
+            cleaned = to_odoo_date(v) if v else (today_str if f_info[k].get("required") else "")
             if len(cleaned) >= 10 and cleaned[4] == "-":
                 safe_vals[k] = f"{cleaned[:10]} 00:00:00" if (ftype == "datetime" and len(cleaned) == 10) else cleaned
             else:
                 safe_vals[k] = False
         else:
             safe_vals[k] = v
+
+    for k, meta in f_info.items():
+        if meta.get("required") and meta.get("type") in ("date", "datetime") and not safe_vals.get(k):
+            safe_vals[k] = f"{today_str} 00:00:00" if meta["type"] == "datetime" else today_str
+
 
     wiz_id = execute_with_uid(url, db, uid, pw, w["res_model"], "create", [safe_vals], {"context": user_ctx}, timeout=timeout)
 
