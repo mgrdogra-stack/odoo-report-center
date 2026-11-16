@@ -158,8 +158,8 @@ def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
             (start_fields if is_start else end_fields).append((fname, ftype))
             if fname in default_vals and default_vals[fname]:
                 clean_def = to_odoo_date(default_vals[fname])
-                if len(clean_def) == 10 and clean_def == "-":
-                    default_vals[fname] = f"{clean_def} 00:00:00" if ftype == "datetime" else clean_def
+                if len(clean_def) >= 10 and clean_def == "-":
+                    default_vals[fname] = f"{clean_def[:10]} 00:00:00" if (ftype == "datetime" and len(clean_def) == 10) else clean_def
                 else:
                     default_vals[fname] = False
             raw_d = to_odoo_date(cur_from) if is_start else to_odoo_date(cur_to)
@@ -176,7 +176,6 @@ def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
             if rel_model in skip_models:
                 continue
             try:
-                # Lightweight name_search is 3x faster than full search_read
                 search_arg = "GRIR" if (rel_model == "account.account" and ("grir" in model.lower() or "grir" in w["name"].lower())) else ""
                 pairs = execute_with_uid(url, db, uid, pw, rel_model, "name_search", [], {"name": search_arg, "limit": 120}, timeout=15)
                 if not pairs and search_arg:
@@ -191,7 +190,7 @@ def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
 
     return {"valid_fields": valid_fields, "field_types": field_types, "start_fields": start_fields, "end_fields": end_fields, "defaults": default_vals, "buttons": btns, "summary": field_summary, "rel_fields": rel_fields}
 
-print("✅ Cell 2A-1 (Fast Cached Auth + Lightweight name_search) loaded!")
+print("✅ Cell 2A-1 loaded cleanly!")
 
 def connect_and_discover(url, db, user, pw, progress=gr.Progress()):
     try:
