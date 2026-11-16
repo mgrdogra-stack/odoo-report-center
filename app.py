@@ -352,7 +352,6 @@ def sync_ui_to_json(params_json, d_from, d_to, is_as_on, f1_label, f1_vals, f2_l
 
 print("✅ Cell 2A-2 loaded!")
 
-
 import pandas as pd
 import io, time, gc, xlsxwriter, urllib.parse
 from datetime import datetime, timedelta
@@ -474,7 +473,7 @@ def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, 
         with opener.open(dl_url, timeout=timeout) as resp:
             return resp.read(), f"{w['name'].replace(' ', '_')}.xlsx", "export_to_xlsx"
 
-        f_info = execute_with_uid(url, db, uid, pw, w["res_model"], "fields_get", [], {"attributes": ["type", "required"]}, timeout=timeout)
+    f_info = execute_with_uid(url, db, uid, pw, w["res_model"], "fields_get", [], {"attributes": ["type", "required"]}, timeout=timeout)
     today_str = datetime.today().strftime("%Y-%m-%d")
     safe_vals = {}
     for k, v in wiz_vals.items():
@@ -493,7 +492,6 @@ def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, 
     for k, meta in f_info.items():
         if meta.get("required") and meta.get("type") in ("date", "datetime") and not safe_vals.get(k):
             safe_vals[k] = f"{today_str} 00:00:00" if meta["type"] == "datetime" else today_str
-
 
     wiz_id = execute_with_uid(url, db, uid, pw, w["res_model"], "create", [safe_vals], {"context": user_ctx}, timeout=timeout)
 
