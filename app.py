@@ -623,31 +623,28 @@ def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, 
 print("✅ Cell 3 loaded successfully!")
 
 import threading, re, io, json, tempfile, os, base64, requests, time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import gradio as gr
 
 STOP_EVENT = threading.Event()
-OPENER_CACHE = {}
 CTX_CACHE = {}
 
 def stop_generation():
     STOP_EVENT.set()
-    return "🛑 Stop signal sent!"
+    return "🛑 **Stop signal sent! Cancelling request...**"
 
-def get_cached_web_session(url, db, user, pw):
-    key = (url.strip().rstrip("/"), db.strip(), user.strip(), pw)
-    if key not in OPENER_CACHE:
-        clean_url = key[0]
-        sess = requests.Session()
-        sess.headers.update({"User-Agent": "Mozilla/5.0"})
-        auth_payload = {"jsonrpc": "2.0", "params": {"db": db, "login": user, "password": pw}}
-        resp = sess.post(f"{clean_url}/web/session/authenticate", json=auth_payload, timeout=30)
-        resp.raise_for_status()
-        auth_res = resp.json()
-        if "error" in auth_res or not auth_res.get("result", {}).get("uid"):
-            raise Exception("Web session authentication failed.")
-        OPENER_CACHE[key] = (sess, clean_url)
-    return OPENER_CACHE[key]
+def create_fresh_web_session(url, db, user, pw):
+    clean_url = url.strip().rstrip("/")
+    sess = requests.Session()
+    sess.headers.update({"User-Agent": "Mozilla/5.0"})
+    auth_payload = {"jsonrpc": "2.0", "params": {"db": db, "login": user, "password": pw}}
+    resp = sess.post(f"{clean_url}/web/session/authenticate", json=auth_payload, timeout=30)
+    resp.raise_for_status()
+    auth_res = resp.json()
+    if "error" in auth_res or not auth_res.get("result", {}).get("uid"):
+        raise Exception("Web session authentication failed.")
+    return sess, clean_url
 
 def get_cached_context(url, db, uid, pw):
     key = (url.strip().rstrip("/"), db.strip(), uid)
@@ -655,174 +652,126 @@ def get_cached_context(url, db, uid, pw):
         CTX_CACHE[key] = execute_with_uid(url, db, uid, pw, "res.users", "context_get", [], timeout=45) or {}
     return CTX_CACHE[key]
 
-def run_wizard_and_download(url, db, user, pw, selected_label, wiz_map, params_json, btn_method, progress=gr.Progress()):
+def make_progress_html(pct, stage_text, elapsed_sec):
+    pct = max(0, min(100, int(pct)))
+    return (
+        f'<div style="background: rgba(15, 23, 42, 0.92); border: 1px solid rgba(56, 189, 248, 0.45); border-radius: 10px; padding: 14px; margin-top: 6px;">'
+        f'<div style="display: flex; justify-content: space-between; margin-bottom: 6px; font-weight: 700; color: #38bdf8;">'
+        f'<span>⏳ {stage_text}</span><span style="color: #fde047;">{pct}% • {elapsed_sec:.1f}s</span></div>'
+        f'<div style="width: 100%; height: 14px; background: rgba(30, 41, 59, 0.9); border-radius: 7px; overflow: hidden; border: 1px solid rgba(251, 191, 36, 0.35);">'
+        f'<div style="width: {pct}%; height: 100%; background: linear-gradient(90deg, #d97706 0%, #f59e0b 50%, #fde047 100%); transition: width 0.4s ease;"></div>'
+        f'</div></div>'
+    )
+
+def run_wizard_and_download(url, db, user, pw, selected_label, wiz_map, params_json, btn_method):
     STOP_EVENT.clear()
     t0 = time.time()
     try:
         if not selected_label or selected_label not in wiz_map:
-            raise Exception("Please select a valid wizard report first.")
-        progress(0.10, desc="Connecting with cached session...")
+            yield "❌ **Please select a valid wizard report first.**", None
+            return
+
+        yield make_progress_html(8, "Authenticating session with Odoo...", time.time() - t0), None
         uid = get_cached_uid(url, db, user, pw)
-        web_sess, clean_base = get_cached_web_session(url, db, user, pw)
+        web_sess, clean_base = create_fresh_web_session(url, db, user, pw)
         user_ctx = get_cached_context(url, db, uid, pw)
 
-        class FastStreamOpener:
+        yield make_progress_html(18, "Preparing wizard parameters...", time.time() - t0), None
+        w = wiz_map[selected_label]
+        wiz_vals = json.loads(params_json) if params_json.strip() else {}
+        download_stats = {"bytes": 0, "stage": f"Odoo server calculating '{w['name']}' (TB-accurate single query)..."}
+
+        class LiveStreamOpener:
             def open(self, target_url, timeout=900):
+                download_stats["stage"] = f"Downloading '{w['name']}' from Odoo server..."
                 r = web_sess.get(target_url, timeout=timeout, stream=True)
                 r.raise_for_status()
                 buf = io.BytesIO()
-                for chunk in r.iter_content(chunk_size=1048576):
+                for chunk in r.iter_content(chunk_size=524288):
                     if STOP_EVENT.is_set():
                         raise Exception("Download cancelled by user.")
                     if chunk:
                         buf.write(chunk)
+                        download_stats["bytes"] += len(chunk)
+                        mb_so_far = download_stats["bytes"] / (1024 * 1024)
+                        download_stats["stage"] = f"Receiving file stream: {mb_so_far:.1f} MB downloaded..."
                 buf.seek(0)
                 return buf
 
-        w = wiz_map[selected_label]
-        wiz_vals = json.loads(params_json) if params_json.strip() else {}
+        def worker():
+            return fetch_single_wizard_fast(
+                url, db, uid, pw, LiveStreamOpener(), clean_base, w, wiz_vals, btn_method, user_ctx, timeout=900
+            )
 
-        progress(0.30, desc=f"Odoo server is generating exact '{w['name']}' report (single query, TB-accurate)...")
-        file_bytes, fname_out, _ = fetch_single_wizard_fast(
-            url, db, uid, pw, FastStreamOpener(), clean_base, w, wiz_vals, btn_method, user_ctx, timeout=900
-        )
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(worker)
+            while not fut.done():
+                if STOP_EVENT.is_set():
+                    yield "🛑 **Request cancelled by user.**", None
+                    return
+                elapsed = time.time() - t0
+                if download_stats["bytes"] > 0:
+                    pct = min(95, 75 + int((download_stats["bytes"] / (1024 * 1024)) * 0.4))
+                else:
+                    pct = min(74, 20 + int((elapsed / (elapsed + 60.0)) * 55))
+                yield make_progress_html(pct, download_stats["stage"], elapsed), None
+                time.sleep(1.5)
+            file_bytes, fname_out, _ = fut.result()
 
         if not file_bytes:
-            raise Exception("Odoo returned an empty file. Check the wizard parameters or required fields.")
+            yield "❌ **Odoo returned an empty file. Check the wizard parameters or required fields.**", None
+            return
 
+        yield make_progress_html(98, "Saving final report to disk...", time.time() - t0), None
         final_mb = len(file_bytes) / (1024 * 1024)
         out_path = os.path.join(tempfile.gettempdir(), fname_out)
         with open(out_path, "wb") as f:
             f.write(file_bytes)
 
         elapsed = time.time() - t0
-        progress(1.0, desc="Done!")
-        return (
-            f"✅ Generated **{fname_out}** ({final_mb:.1f} MB, exact Odoo output & formatting) in **{elapsed:.1f}s**!\n\n"
-            f"👉 **Download below** or click **[Direct Browser Download](/file={out_path})**.",
-            out_path,
+        done_banner = (
+            f"✅ **Completed `{fname_out}`** ({final_mb:.1f} MB, exact Odoo formatting & TB-accurate) in **{elapsed:.1f}s**!\n\n"
+            f"👉 **Download below** or click **[Direct Browser Download](/file={out_path})**."
         )
+        yield done_banner, out_path
     except Exception as e:
-        return f"❌ Generation failed: {str(e)}", None
+        yield f"❌ **Generation failed:** {str(e)}", None
 
 def disconnect_session():
     UID_CACHE.clear()
-    OPENER_CACHE.clear()
     CTX_CACHE.clear()
     return (
-        "",
-        "ℹ Session cleared successfully.",
-        gr.update(choices=[], value=None),
-        {},
-        "*Choose a report from the sidebar menu to populate details here.*",
-        "{}",
-        gr.update(choices=[], value=None),
-        gr.update(choices=[], value=[]),
-        gr.update(choices=[], value=None),
-        gr.update(choices=[], value=[]),
-        {},
-        "**Ready for instructions...**",
-        None,
+        "", "ℹ Session cleared successfully.", gr.update(choices=[], value=None), {},
+        "*Choose a report from the sidebar menu to populate details here.*", "{}",
+        gr.update(choices=[], value=None), gr.update(choices=[], value=[]),
+        gr.update(choices=[], value=None), gr.update(choices=[], value=[]),
+        {}, "**Ready for instructions...**", None,
     )
 
-custom_css = """
-html, body, .gradio-container, .gradio-container-3-50, #component-0 {
-    background-color: #0b0f19 !important;
-    background-image:
-        linear-gradient(180deg, rgba(11, 15, 25, 0.55) 0%, rgba(11, 15, 25, 0.85) 100%),
-        url('/file=accounting-vs-finance-differences-ohsc.webp') !important;
-    background-size: cover !important;
-    background-position: center !important;
-    color: #f8fafc !important;
-}
-.gradio-container * { font-family: 'Segoe UI', -apple-system, sans-serif !important; }
-.gradio-container .wrap.default, .gradio-container .progress-bar-wrap, .gradio-container .toast-wrap {
-    background: rgba(15, 18, 28, 0.94) !important;
-    border: 1px solid rgba(251, 191, 36, 0.5) !important;
-    border-radius: 8px !important;
-    color: #ffffff !important;
-    z-index: 9999 !important;
-}
-.gradio-container .progress-level {
-    background: rgba(30, 41, 59, 0.85) !important;
-    border-radius: 6px !important;
-    overflow: hidden !important;
-    height: 10px !important;
-    border: 1px solid rgba(251, 191, 36, 0.3) !important;
-}
-.gradio-container .progress-level-inner, .gradio-container .progress-bar, .gradio-container progress::-webkit-progress-value {
-    background: linear-gradient(90deg, #d97706 0%, #f59e0b 50%, #fde047 100%) !important;
-    background-color: #f59e0b !important;
-    height: 100% !important;
-}
-.gradio-container .progress-text, .gradio-container .meta-text { color: #fcd34d !important; font-weight: 700 !important; }
-.gradio-container .block, .gradio-container .wrap, .gradio-container .form, .gradio-container .panel, .gradio-container div[class*='svelte-'] {
-    background: transparent !important;
-    background-color: transparent !important;
-    border-color: rgba(255, 255, 255, 0.12) !important;
-}
-.gradio-container .accordion, .gradio-container div[class*='variant-panel'], .gradio-container .gr-group {
-    background: rgba(11, 17, 32, 0.86) !important;
-    border: 1px solid rgba(56, 189, 248, 0.25) !important;
-    border-radius: 12px !important;
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4) !important;
-    padding: 12px !important;
-}
-.gradio-container .accordion > button, .gradio-container .label-wrap {
-    background: rgba(15, 23, 42, 0.85) !important;
-    color: #38bdf8 !important;
-    font-weight: 700 !important;
-    border-radius: 8px !important;
-    padding: 8px 12px !important;
-}
-.gradio-container label span, .gradio-container .form label {
-    color: #7dd3fc !important;
-    font-weight: 700 !important;
-    text-transform: uppercase !important;
-    font-size: 0.8rem !important;
-    letter-spacing: 0.6px !important;
-}
-.gradio-container input, .gradio-container select, .gradio-container textarea, .gradio-container .secondary-wrap {
-    background: rgba(7, 11, 22, 0.85) !important;
-    color: #ffffff !important;
-    border: 1px solid rgba(125, 211, 252, 0.3) !important;
-    border-radius: 6px !important;
-}
-.gradio-container button.primary {
-    background: linear-gradient(135deg, #0284c7 0%, #2563eb 100%) !important;
-    color: #ffffff !important;
-    font-weight: 700 !important;
-    border: 1px solid rgba(125, 211, 252, 0.4) !important;
-}
-.gradio-container button.secondary {
-    background: rgba(15, 23, 42, 0.85) !important;
-    color: #e2e8f0 !important;
-    font-weight: 600 !important;
-    border: 1px solid rgba(148, 163, 184, 0.35) !important;
-}
-.gradio-container button.secondary:hover {
-    background: rgba(30, 41, 59, 0.95) !important;
-    border-color: #38bdf8 !important;
-}
-.mechanical-roller {
-    height: 3px; width: 100%;
-    background: repeating-linear-gradient(90deg, #38bdf8 0px, #38bdf8 10px, transparent 10px, transparent 20px);
-    margin: 12px 0 0 0; border-radius: 2px; opacity: 0.8;
-}
-.gear-icon { display: inline-block; font-size: 2.2rem; color: #38bdf8; line-height: 1; }
-.glow-banner {
-    background: rgba(11, 17, 32, 0.86) !important;
-    border-radius: 12px !important;
-    border: 1px solid rgba(56, 189, 248, 0.3) !important;
-    padding: 1.5rem !important;
-    text-align: center !important;
-    margin-bottom: 1.2rem !important;
-}
-.glow-logo { font-weight: 800 !important; font-size: 2.6rem !important; color: #ffffff !important; letter-spacing: 3px !important; }
-.glow-banner p { font-size: 1rem !important; color: #cbd5e1 !important; margin: 0.4rem 0 0 0 !important; font-weight: 600 !important; letter-spacing: 1.2px !important; }
-"""
+print("✅ Cell 5A loaded!")
+custom_css = "\n".join([
+    "html, body, .gradio-container, .gradio-container-3-50, #component-0 { background-color: #0b0f19 !important; background-image: linear-gradient(180deg, rgba(11, 15, 25, 0.55) 0%, rgba(11, 15, 25, 0.85) 100%), url('/file=accounting-vs-finance-differences-ohsc.webp') !important; background-size: cover !important; background-position: center !important; color: #f8fafc !important; }",
+    ".gradio-container * { font-family: 'Segoe UI', -apple-system, sans-serif !important; }",
+    ".gradio-container .wrap.default, .gradio-container .progress-bar-wrap, .gradio-container .toast-wrap { background: rgba(15, 18, 28, 0.94) !important; border: 1px solid rgba(251, 191, 36, 0.5) !important; border-radius: 8px !important; color: #ffffff !important; z-index: 9999 !important; }",
+    ".gradio-container .progress-level { background: rgba(30, 41, 59, 0.85) !important; border-radius: 6px !important; overflow: hidden !important; height: 10px !important; border: 1px solid rgba(251, 191, 36, 0.3) !important; }",
+    ".gradio-container .progress-level-inner, .gradio-container .progress-bar, .gradio-container progress::-webkit-progress-value { background: linear-gradient(90deg, #d97706 0%, #f59e0b 50%, #fde047 100%) !important; background-color: #f59e0b !important; height: 100% !important; }",
+    ".gradio-container .progress-text, .gradio-container .meta-text { color: #fcd34d !important; font-weight: 700 !important; }",
+    ".gradio-container .block, .gradio-container .wrap, .gradio-container .form, .gradio-container .panel, .gradio-container div[class*='svelte-'] { background: transparent !important; background-color: transparent !important; border-color: rgba(255, 255, 255, 0.12) !important; }",
+    ".gradio-container .accordion, .gradio-container div[class*='variant-panel'], .gradio-container .gr-group { background: rgba(11, 17, 32, 0.86) !important; border: 1px solid rgba(56, 189, 248, 0.25) !important; border-radius: 12px !important; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4) !important; padding: 12px !important; }",
+    ".gradio-container .accordion > button, .gradio-container .label-wrap { background: rgba(15, 23, 42, 0.85) !important; color: #38bdf8 !important; font-weight: 700 !important; border-radius: 8px !important; padding: 8px 12px !important; }",
+    ".gradio-container label span, .gradio-container .form label { color: #7dd3fc !important; font-weight: 700 !important; text-transform: uppercase !important; font-size: 0.8rem !important; letter-spacing: 0.6px !important; }",
+    ".gradio-container input, .gradio-container select, .gradio-container textarea, .gradio-container .secondary-wrap { background: rgba(7, 11, 22, 0.85) !important; color: #ffffff !important; border: 1px solid rgba(125, 211, 252, 0.3) !important; border-radius: 6px !important; }",
+    ".gradio-container button.primary { background: linear-gradient(135deg, #0284c7 0%, #2563eb 100%) !important; color: #ffffff !important; font-weight: 700 !important; border: 1px solid rgba(125, 211, 252, 0.4) !important; }",
+    ".gradio-container button.secondary { background: rgba(15, 23, 42, 0.85) !important; color: #e2e8f0 !important; font-weight: 600 !important; border: 1px solid rgba(148, 163, 184, 0.35) !important; }",
+    ".gradio-container button.secondary:hover { background: rgba(30, 41, 59, 0.95) !important; border-color: #38bdf8 !important; }",
+    ".mechanical-roller { height: 3px; width: 100%; background: repeating-linear-gradient(90deg, #38bdf8 0px, #38bdf8 10px, transparent 10px, transparent 20px); margin: 12px 0 0 0; border-radius: 2px; opacity: 0.8; }",
+    ".gear-icon { display: inline-block; font-size: 2.2rem; color: #38bdf8; line-height: 1; }",
+    ".glow-banner { background: rgba(11, 17, 32, 0.86) !important; border-radius: 12px !important; border: 1px solid rgba(56, 189, 248, 0.3) !important; padding: 1.5rem !important; text-align: center !important; margin-bottom: 1.2rem !important; }",
+    ".glow-logo { font-weight: 800 !important; font-size: 2.6rem !important; color: #ffffff !important; letter-spacing: 3px !important; }",
+    ".glow-banner p { font-size: 1rem !important; color: #cbd5e1 !important; margin: 0.4rem 0 0 0 !important; font-weight: 600 !important; letter-spacing: 1.2px !important; }",
+])
+print("✅ Cell 5B (CSS) loaded!")
 
-print("✅ Cell 5 finalized: Single exact Odoo query, TB-accurate, zero chunking!")
 
 with gr.Blocks(title="MGR DOGRA - ENTERPRISE COCKPIT") as demo:
     gr.HTML(
