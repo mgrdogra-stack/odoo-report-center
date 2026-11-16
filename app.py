@@ -589,6 +589,30 @@ def rpc_fetch_all(url, db, uid, pw, model, domain, fields, batch_size=2000, prog
         offset += len(chunk)
     return out
 
+import openpyxl
+
+def optimize_large_xlsx(file_bytes, fname_out, threshold_mb=3.0):
+    """Strips heavy Odoo XML styles from large .xlsx files without losing any sheet, row, or column."""
+    if not fname_out.lower().endswith(".xlsx") or len(file_bytes) < threshold_mb * 1024 * 1024:
+        return file_bytes, fname_out
+    try:
+        wb_in = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+        wb_out = openpyxl.Workbook(write_only=True)
+        for sheet_name in wb_in.sheetnames:
+            ws_in = wb_in[sheet_name]
+            ws_out = wb_out.create_sheet(title=sheet_name)
+            for row in ws_in.iter_rows(values_only=True):
+                ws_out.append(list(row))
+        wb_in.close()
+        out_buf = io.BytesIO()
+        wb_out.save(out_buf)
+        slim_bytes = out_buf.getvalue()
+        if len(slim_bytes) < len(file_bytes):
+            return slim_bytes, fname_out
+    except Exception:
+        pass
+    return file_bytes, fname_out
+
 def run_wizard_and_download(url, db, user, pw, selected_label, wiz_map, params_json, btn_method, progress=gr.Progress()):
     try:
         if not selected_label or selected_label not in wiz_map:
@@ -604,12 +628,19 @@ def run_wizard_and_download(url, db, user, pw, selected_label, wiz_map, params_j
         file_bytes, fname_out, used_method = fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, btn_method, user_ctx, timeout=900)
         if not file_bytes:
             raise Exception("Odoo returned an empty file. Check the wizard parameters or required fields.")
-        progress(0.90, desc="Downloading & saving report file...")
+
+        raw_mb = len(file_bytes) / (1024 * 1024)
+        progress(0.82, desc=f"Compressing {raw_mb:.1f} MB report without losing rows/columns...")
+        file_bytes, fname_out = optimize_large_xlsx(file_bytes, fname_out, threshold_mb=3.0)
+        final_mb = len(file_bytes) / (1024 * 1024)
+
+        progress(0.95, desc="Saving optimized report file...")
         out_path = os.path.join(tempfile.gettempdir(), fname_out)
         with open(out_path, "wb") as f:
             f.write(file_bytes)
         progress(1.0, desc="Done!")
-        return f"✅ Successfully generated report ({fname_out})!", out_path
+        size_note = f"{raw_mb:.1f} MB → {final_mb:.1f} MB" if raw_mb > final_mb + 0.5 else f"{final_mb:.1f} MB"
+        return f"✅ Successfully generated **{fname_out}** ({size_note}, all rows & columns preserved)!", out_path
     except Exception as e:
         return f"❌ Generation failed: {str(e)}", None
 
