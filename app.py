@@ -622,24 +622,24 @@ def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, 
 
 print("✅ Cell 3 loaded successfully!")
 
-import threading, re, io, json, tempfile, os, base64, requests, time
+import threading, re, io, json, tempfile, os, base64, requests, time, openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import gradio as gr
 
-STOP_EVENT = threading.Event()
+CURRENT_RUN = {"stop": False}
 CTX_CACHE = {}
 
 def stop_generation():
-    STOP_EVENT.set()
-    return "🛑 **Stop signal sent! Cancelling request...**"
+    CURRENT_RUN["stop"] = True
+    return "🛑 **Stop signal sent! Ready for a new request.**"
 
 def create_fresh_web_session(url, db, user, pw):
     clean_url = url.strip().rstrip("/")
     sess = requests.Session()
     sess.headers.update({"User-Agent": "Mozilla/5.0"})
-    auth_payload = {"jsonrpc": "2.0", "params": {"db": db, "login": user, "password": pw}}
-    resp = sess.post(f"{clean_url}/web/session/authenticate", json=auth_payload, timeout=30)
+    resp = sess.post(f"{clean_url}/web/session/authenticate", json={"jsonrpc": "2.0", "params": {"db": db, "login": user, "password": pw}}, timeout=30)
     resp.raise_for_status()
     auth_res = resp.json()
     if "error" in auth_res or not auth_res.get("result", {}).get("uid"):
@@ -663,114 +663,181 @@ def make_progress_html(pct, stage_text, elapsed_sec):
         f'</div></div>'
     )
 
+def detect_target_accounts(url, db, uid, pw, w, wiz_vals):
+    acc_ids = []
+    for k, v in wiz_vals.items():
+        if "account" in k.lower() and v:
+            if isinstance(v, int) and not isinstance(v, bool):
+                acc_ids.append(v)
+            elif isinstance(v, list):
+                for item in v:
+                    if isinstance(item, list) and len(item) >= 3 and item[0] == 6 and isinstance(item[2], list):
+                        acc_ids.extend([x for x in item[2] if isinstance(x, int)])
+                    elif isinstance(item, int):
+                        acc_ids.append(item)
+    if acc_ids:
+        accs = execute_with_uid(url, db, uid, pw, "account.account", "search_read", [[["id", "in", list(set(acc_ids))]]], {"fields": ["id", "code", "name"]}, timeout=30)
+        return accs or [], "Selected Wizard Account(s)"
+    rname = f"{w.get('name', '')} {w.get('res_model', '')}".lower()
+    domain, category = None, "General / Selected Scope"
+    if "grir" in rname:
+        domain, category = ["|", ["name", "ilike", "GRIR"], ["code", "=like", "181%"]], "GRIR Clearing Accounts (181xxx)"
+    elif any(k in rname for k in ("kardex", "inventory", "valuation", "stock")):
+        domain, category = ["|", ["name", "ilike", "INVENTORY"], ["code", "=like", "551%"]], "Inventory Valuation Accounts (551xxx)"
+    elif any(k in rname for k in ("sales", "rfid", "dispatch", "revenue")):
+        domain, category = [["account_type", "in", ["income", "income_other"]]], "Sales / Revenue Accounts"
+    elif any(k in rname for k in ("purchase", "vendor", "bill")):
+        domain, category = [["account_type", "in", ["expense", "expense_direct_cost"]]], "Purchase / Direct Cost Accounts"
+    if domain:
+        accs = execute_with_uid(url, db, uid, pw, "account.account", "search_read", [domain], {"fields": ["id", "code", "name"], "order": "code asc", "limit": 200}, timeout=45)
+        return accs or [], category
+    return [], category
+
+print("✅ Cell 5A-Part 1 loaded!")
+def sum_report_sheet_totals(ws):
+    header_row_idx, dr_col, cr_col, bal_col = None, None, None, None
+    for r_idx in range(1, min(30, ws.max_row + 1)):
+        row_vals = [str(ws.cell(r_idx, c).value or "").strip().lower() for c in range(1, ws.max_column + 1)]
+        for c_idx, h in enumerate(row_vals, start=1):
+            if h in ("debit", "dr", "debit amount", "total debit"): dr_col = c_idx
+            elif h in ("credit", "cr", "credit amount", "total credit"): cr_col = c_idx
+            elif any(k in h for k in ("balance", "closing", "net amount", "unbilled", "grir", "valuation", "total value", "amount", "value")):
+                if bal_col is None or any(p in h for p in ("balance", "closing", "unbilled", "valuation", "net")): bal_col = c_idx
+        if dr_col or cr_col or bal_col:
+            header_row_idx = r_idx; break
+    rep_dr = rep_cr = rep_bal = 0.0; data_rows = 0
+    if header_row_idx:
+        for r_idx in range(header_row_idx + 1, ws.max_row + 1):
+            first_cells = " ".join(str(ws.cell(r_idx, c).value or "").lower() for c in range(1, min(6, ws.max_column + 1)))
+            if any(t in first_cells for t in ("total", "subtotal", "grand total", "closing balance", "opening balance")): continue
+            has_num = False
+            if dr_col and isinstance(ws.cell(r_idx, dr_col).value, (int, float)): rep_dr += float(ws.cell(r_idx, dr_col).value); has_num = True
+            if cr_col and isinstance(ws.cell(r_idx, cr_col).value, (int, float)): rep_cr += float(ws.cell(r_idx, cr_col).value); has_num = True
+            if bal_col and isinstance(ws.cell(r_idx, bal_col).value, (int, float)): rep_bal += float(ws.cell(r_idx, bal_col).value); has_num = True
+            if has_num: data_rows += 1
+    if dr_col and cr_col and bal_col is None: rep_bal = rep_dr - rep_cr
+    return rep_dr, rep_cr, rep_bal, data_rows
+
+def append_tb_reconciliation_sheet(file_bytes, fname_out, url, db, uid, pw, w, wiz_vals):
+    if not fname_out.lower().endswith(".xlsx"): return file_bytes, ""
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
+        rep_dr, rep_cr, rep_bal, data_rows = sum_report_sheet_totals(wb[wb.sheetnames[0]])
+        prof = w.get("profile", {})
+        date_from = next((str(wiz_vals[sf])[:10] for sf, _ in prof.get("start_fields", []) if wiz_vals.get(sf)), None)
+        date_to = next((str(wiz_vals[ef])[:10] for ef, _ in prof.get("end_fields", []) if wiz_vals.get(ef)), None) or next((str(v)[:10] for k, v in wiz_vals.items() if any(x in k.lower() for x in ("to", "end", "as_on", "date")) and v), None)
+        accs, category_label = detect_target_accounts(url, db, uid, pw, w, wiz_vals)
+        acc_ids = [a["id"] for a in accs]
+
+        def query_tb(include_draft=True):
+            base_dom = [["parent_state", "in", ["posted", "draft"] if include_draft else ["posted"]]] + ([["account_id", "in", acc_ids]] if acc_ids else [])
+            open_map, per_map = {}, {}
+            if date_from:
+                for g in (execute_with_uid(url, db, uid, pw, "account.move.line", "read_group", [base_dom + [["date", "<", date_from]], ["account_id", "balance"], ["account_id"]], {"lazy": False}, timeout=90) or []):
+                    aid = g["account_id"][0] if isinstance(g.get("account_id"), (list, tuple)) else g.get("account_id")
+                    if aid: open_map[aid] = float(g.get("balance", 0.0) or 0.0)
+            per_dom = base_dom + ([["date", ">=", date_from]] if date_from else []) + ([["date", "<=", date_to]] if date_to else [])
+            for g in (execute_with_uid(url, db, uid, pw, "account.move.line", "read_group", [per_dom, ["account_id", "debit", "credit", "balance"], ["account_id"]], {"lazy": False}, timeout=90) or []):
+                aid = g["account_id"][0] if isinstance(g.get("account_id"), (list, tuple)) else g.get("account_id")
+                if aid: per_map[aid] = (float(g.get("debit", 0.0) or 0.0), float(g.get("credit", 0.0) or 0.0), float(g.get("balance", 0.0) or 0.0))
+            return open_map, per_map
+
+        open_d, per_d = query_tb(True)
+        open_p, per_p = query_tb(False)
+        if not accs:
+            all_ids = sorted(set(list(open_d.keys()) + list(per_d.keys())))
+            if all_ids: accs = execute_with_uid(url, db, uid, pw, "account.account", "search_read", [[["id", "in", all_ids]]], {"fields": ["id", "code", "name"], "order": "code asc"}, timeout=45) or []
+
+        if "TB_Reconciliation" in wb.sheetnames: del wb["TB_Reconciliation"]
+        ws_tb = wb.create_sheet(title="TB_Reconciliation")
+        hdr_fill, hdr_font, bold_font = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid"), Font(color="FFFFFF", bold=True), Font(bold=True)
+        ws_tb.append(["AUTO TRIAL BALANCE RECONCILIATION", w["name"]]); ws_tb["A1"].font = Font(size=13, bold=True)
+        ws_tb.append(["Scope", category_label]); ws_tb.append(["Period", f"{date_from or 'Beginning'} -> {date_to or 'Current'}"]); ws_tb.append(["Report Rows Counted", data_rows]); ws_tb.append([])
+        ws_tb.append(["Account Code", "Account Name", "Initial Balance", "Period Debit", "Period Credit", "TB End (With Draft)", "TB End (Posted Only)"])
+        for col_idx in range(1, 8): c = ws_tb.cell(ws_tb.max_row, col_idx); c.fill = hdr_fill; c.font = hdr_font
+
+        tot_init = tot_dr = tot_cr = tot_end_d = tot_end_p = 0.0
+        for a in accs:
+            aid = a["id"]; init_b = open_d.get(aid, 0.0); p_dr, p_cr, p_bal = per_d.get(aid, (0.0, 0.0, 0.0))
+            end_d = init_b + p_bal; end_p = open_p.get(aid, 0.0) + per_p.get(aid, (0.0, 0.0, 0.0))[2]
+            if round(init_b, 2) == 0 and round(p_dr, 2) == 0 and round(p_cr, 2) == 0 and round(end_d, 2) == 0: continue
+            tot_init += init_b; tot_dr += p_dr; tot_cr += p_cr; tot_end_d += end_d; tot_end_p += end_p
+            ws_tb.append([a.get("code", ""), a.get("name", ""), round(init_b, 2), round(p_dr, 2), round(p_cr, 2), round(end_d, 2), round(end_p, 2)])
+
+        ws_tb.append(["TOTAL", "Trial Balance Control Total", round(tot_init, 2), round(tot_dr, 2), round(tot_cr, 2), round(tot_end_d, 2), round(tot_end_p, 2)])
+        for col_idx in range(1, 8): ws_tb.cell(ws_tb.max_row, col_idx).font = bold_font
+        ws_tb.append([]); ws_tb.append(["RECONCILIATION SUMMARY", "Total Debit (Dr)", "Total Credit (Cr)", "Closing / Net Balance"])
+        for col_idx in range(1, 5): c = ws_tb.cell(ws_tb.max_row, col_idx); c.fill = hdr_fill; c.font = hdr_font
+        ws_tb.append(["1. Extracted Report Total (Sheet 1)", round(rep_dr, 2), round(rep_cr, 2), round(rep_bal, 2)])
+        ws_tb.append(["2. Odoo TB Total (With Draft)", round(tot_dr, 2), round(tot_cr, 2), round(tot_end_d, 2)])
+        ws_tb.append(["3. Odoo TB Total (Posted Only)", "-", "-", round(tot_end_p, 2)])
+        diff_d, diff_p = round(abs(rep_bal) - abs(tot_end_d), 2), round(abs(rep_bal) - abs(tot_end_p), 2)
+        ws_tb.append(["4. Variance vs TB (With Draft)", round(rep_dr - tot_dr, 2), round(rep_cr - tot_cr, 2), diff_d])
+        ws_tb.append(["5. Variance vs TB (Posted Only)", "-", "-", diff_p])
+        status_msg = "MATCHED WITH TB (WITH DRAFT)" if abs(diff_d) < 1.0 else ("MATCHED WITH TB (POSTED)" if abs(diff_p) < 1.0 else f"VARIANCE: {diff_d:,.2f} (Draft) / {diff_p:,.2f} (Posted)")
+        ws_tb.append(["RECONCILIATION STATUS", status_msg])
+        for col_letter, width in [("A", 18), ("B", 42), ("C", 24), ("D", 22), ("E", 22), ("F", 24), ("G", 24)]: ws_tb.column_dimensions[col_letter].width = width
+        out_buf = io.BytesIO(); wb.save(out_buf); wb.close()
+        return out_buf.getvalue(), f"\n📊 **TB Reconciliation (`TB_Reconciliation` tab):** Report = **{rep_bal:,.2f}** | TB (Draft) = **{tot_end_d:,.2f}** | TB (Posted) = **{tot_end_p:,.2f}** -> **{status_msg}**"
+    except Exception as e:
+        return file_bytes, f"\n⚠️ TB Reconciliation note: {str(e)}"
+
+print("✅ Cell 5A-Part 2 loaded!")
 def run_wizard_and_download(url, db, user, pw, selected_label, wiz_map, params_json, btn_method):
-    STOP_EVENT.clear()
+    run_flag = {"stop": False}
+    global CURRENT_RUN
+    CURRENT_RUN = run_flag
     t0 = time.time()
     try:
         if not selected_label or selected_label not in wiz_map:
-            yield "❌ **Please select a valid wizard report first.**", None
-            return
-
-        yield make_progress_html(8, "Authenticating session with Odoo...", time.time() - t0), None
+            yield "❌ **Please select a valid wizard report first.**", None; return
+        yield make_progress_html(5, "Starting fresh extraction & authenticating...", time.time() - t0), None
         uid = get_cached_uid(url, db, user, pw)
         web_sess, clean_base = create_fresh_web_session(url, db, user, pw)
         user_ctx = get_cached_context(url, db, uid, pw)
-
-        yield make_progress_html(18, "Preparing wizard parameters...", time.time() - t0), None
+        yield make_progress_html(15, "Preparing wizard parameters...", time.time() - t0), None
         w = wiz_map[selected_label]
         wiz_vals = json.loads(params_json) if params_json.strip() else {}
-        download_stats = {"bytes": 0, "stage": f"Odoo server calculating '{w['name']}' (TB-accurate single query)..."}
+        download_stats = {"bytes": 0, "stage": f"Odoo server calculating '{w['name']}'..."}
 
         class LiveStreamOpener:
             def open(self, target_url, timeout=900):
                 download_stats["stage"] = f"Downloading '{w['name']}' from Odoo server..."
-                r = web_sess.get(target_url, timeout=timeout, stream=True)
-                r.raise_for_status()
+                r = web_sess.get(target_url, timeout=timeout, stream=True); r.raise_for_status()
                 buf = io.BytesIO()
                 for chunk in r.iter_content(chunk_size=524288):
-                    if STOP_EVENT.is_set():
-                        raise Exception("Download cancelled by user.")
+                    if run_flag["stop"]: raise Exception("Download cancelled by user.")
                     if chunk:
-                        buf.write(chunk)
-                        download_stats["bytes"] += len(chunk)
-                        mb_so_far = download_stats["bytes"] / (1024 * 1024)
-                        download_stats["stage"] = f"Receiving file stream: {mb_so_far:.1f} MB downloaded..."
-                buf.seek(0)
-                return buf
+                        buf.write(chunk); download_stats["bytes"] += len(chunk)
+                        download_stats["stage"] = f"Receiving file stream: {download_stats['bytes'] / 1048576:.1f} MB downloaded..."
+                buf.seek(0); return buf
 
-        def worker():
-            return fetch_single_wizard_fast(
-                url, db, uid, pw, LiveStreamOpener(), clean_base, w, wiz_vals, btn_method, user_ctx, timeout=900
-            )
+        pool = ThreadPoolExecutor(max_workers=1)
+        fut = pool.submit(lambda: fetch_single_wizard_fast(url, db, uid, pw, LiveStreamOpener(), clean_base, w, wiz_vals, btn_method, user_ctx, timeout=900))
+        pool.shutdown(wait=False)
+        while not fut.done():
+            if run_flag["stop"]: yield "🛑 **Request cancelled by user. Click Execute to start again.**", None; return
+            elapsed = time.time() - t0
+            pct = min(90, 72 + int((download_stats["bytes"] / 1048576) * 0.4)) if download_stats["bytes"] > 0 else min(70, 18 + int((elapsed / (elapsed + 60.0)) * 52))
+            yield make_progress_html(pct, download_stats["stage"], elapsed), None
+            time.sleep(1.5)
 
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            fut = pool.submit(worker)
-            while not fut.done():
-                if STOP_EVENT.is_set():
-                    yield "🛑 **Request cancelled by user.**", None
-                    return
-                elapsed = time.time() - t0
-                if download_stats["bytes"] > 0:
-                    pct = min(95, 75 + int((download_stats["bytes"] / (1024 * 1024)) * 0.4))
-                else:
-                    pct = min(74, 20 + int((elapsed / (elapsed + 60.0)) * 55))
-                yield make_progress_html(pct, download_stats["stage"], elapsed), None
-                time.sleep(1.5)
-            file_bytes, fname_out, _ = fut.result()
-
-        if not file_bytes:
-            yield "❌ **Odoo returned an empty file. Check the wizard parameters or required fields.**", None
-            return
-
+        file_bytes, fname_out, _ = fut.result()
+        if not file_bytes: yield "❌ **Odoo returned an empty file.**", None; return
+        yield make_progress_html(93, "Building Account-by-Account TB Reconciliation sheet...", time.time() - t0), None
+        file_bytes, tb_note = append_tb_reconciliation_sheet(file_bytes, fname_out, url, db, uid, pw, w, wiz_vals)
         yield make_progress_html(98, "Saving final report to disk...", time.time() - t0), None
-        final_mb = len(file_bytes) / (1024 * 1024)
         out_path = os.path.join(tempfile.gettempdir(), fname_out)
-        with open(out_path, "wb") as f:
-            f.write(file_bytes)
-
-        elapsed = time.time() - t0
-        done_banner = (
-            f"✅ **Completed `{fname_out}`** ({final_mb:.1f} MB, exact Odoo formatting & TB-accurate) in **{elapsed:.1f}s**!\n\n"
-            f"👉 **Download below** or click **[Direct Browser Download](/file={out_path})**."
-        )
-        yield done_banner, out_path
+        with open(out_path, "wb") as f: f.write(file_bytes)
+        yield f"✅ **Completed `{fname_out}`** ({len(file_bytes) / 1048576:.1f} MB) in **{time.time() - t0:.1f}s**!{tb_note}\n\n👉 **Download below** or click **[Direct Browser Download](/file={out_path})**.", out_path
     except Exception as e:
         yield f"❌ **Generation failed:** {str(e)}", None
 
 def disconnect_session():
-    UID_CACHE.clear()
-    CTX_CACHE.clear()
-    return (
-        "", "ℹ Session cleared successfully.", gr.update(choices=[], value=None), {},
-        "*Choose a report from the sidebar menu to populate details here.*", "{}",
-        gr.update(choices=[], value=None), gr.update(choices=[], value=[]),
-        gr.update(choices=[], value=None), gr.update(choices=[], value=[]),
-        {}, "**Ready for instructions...**", None,
-    )
+    CURRENT_RUN["stop"] = True; UID_CACHE.clear(); CTX_CACHE.clear()
+    return ("", "ℹ Session cleared.", gr.update(choices=[], value=None), {}, "*Choose a report from the sidebar.*", "{}", gr.update(choices=[], value=None), gr.update(choices=[], value=[]), gr.update(choices=[], value=None), gr.update(choices=[], value=[]), {}, "**Ready for instructions...**", None)
 
-print("✅ Cell 5A loaded!")
-custom_css = "\n".join([
-    "html, body, .gradio-container, .gradio-container-3-50, #component-0 { background-color: #0b0f19 !important; background-image: linear-gradient(180deg, rgba(11, 15, 25, 0.55) 0%, rgba(11, 15, 25, 0.85) 100%), url('/file=accounting-vs-finance-differences-ohsc.webp') !important; background-size: cover !important; background-position: center !important; color: #f8fafc !important; }",
-    ".gradio-container * { font-family: 'Segoe UI', -apple-system, sans-serif !important; }",
-    ".gradio-container .wrap.default, .gradio-container .progress-bar-wrap, .gradio-container .toast-wrap { background: rgba(15, 18, 28, 0.94) !important; border: 1px solid rgba(251, 191, 36, 0.5) !important; border-radius: 8px !important; color: #ffffff !important; z-index: 9999 !important; }",
-    ".gradio-container .progress-level { background: rgba(30, 41, 59, 0.85) !important; border-radius: 6px !important; overflow: hidden !important; height: 10px !important; border: 1px solid rgba(251, 191, 36, 0.3) !important; }",
-    ".gradio-container .progress-level-inner, .gradio-container .progress-bar, .gradio-container progress::-webkit-progress-value { background: linear-gradient(90deg, #d97706 0%, #f59e0b 50%, #fde047 100%) !important; background-color: #f59e0b !important; height: 100% !important; }",
-    ".gradio-container .progress-text, .gradio-container .meta-text { color: #fcd34d !important; font-weight: 700 !important; }",
-    ".gradio-container .block, .gradio-container .wrap, .gradio-container .form, .gradio-container .panel, .gradio-container div[class*='svelte-'] { background: transparent !important; background-color: transparent !important; border-color: rgba(255, 255, 255, 0.12) !important; }",
-    ".gradio-container .accordion, .gradio-container div[class*='variant-panel'], .gradio-container .gr-group { background: rgba(11, 17, 32, 0.86) !important; border: 1px solid rgba(56, 189, 248, 0.25) !important; border-radius: 12px !important; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4) !important; padding: 12px !important; }",
-    ".gradio-container .accordion > button, .gradio-container .label-wrap { background: rgba(15, 23, 42, 0.85) !important; color: #38bdf8 !important; font-weight: 700 !important; border-radius: 8px !important; padding: 8px 12px !important; }",
-    ".gradio-container label span, .gradio-container .form label { color: #7dd3fc !important; font-weight: 700 !important; text-transform: uppercase !important; font-size: 0.8rem !important; letter-spacing: 0.6px !important; }",
-    ".gradio-container input, .gradio-container select, .gradio-container textarea, .gradio-container .secondary-wrap { background: rgba(7, 11, 22, 0.85) !important; color: #ffffff !important; border: 1px solid rgba(125, 211, 252, 0.3) !important; border-radius: 6px !important; }",
-    ".gradio-container button.primary { background: linear-gradient(135deg, #0284c7 0%, #2563eb 100%) !important; color: #ffffff !important; font-weight: 700 !important; border: 1px solid rgba(125, 211, 252, 0.4) !important; }",
-    ".gradio-container button.secondary { background: rgba(15, 23, 42, 0.85) !important; color: #e2e8f0 !important; font-weight: 600 !important; border: 1px solid rgba(148, 163, 184, 0.35) !important; }",
-    ".gradio-container button.secondary:hover { background: rgba(30, 41, 59, 0.95) !important; border-color: #38bdf8 !important; }",
-    ".mechanical-roller { height: 3px; width: 100%; background: repeating-linear-gradient(90deg, #38bdf8 0px, #38bdf8 10px, transparent 10px, transparent 20px); margin: 12px 0 0 0; border-radius: 2px; opacity: 0.8; }",
-    ".gear-icon { display: inline-block; font-size: 2.2rem; color: #38bdf8; line-height: 1; }",
-    ".glow-banner { background: rgba(11, 17, 32, 0.86) !important; border-radius: 12px !important; border: 1px solid rgba(56, 189, 248, 0.3) !important; padding: 1.5rem !important; text-align: center !important; margin-bottom: 1.2rem !important; }",
-    ".glow-logo { font-weight: 800 !important; font-size: 2.6rem !important; color: #ffffff !important; letter-spacing: 3px !important; }",
-    ".glow-banner p { font-size: 1rem !important; color: #cbd5e1 !important; margin: 0.4rem 0 0 0 !important; font-weight: 600 !important; letter-spacing: 1.2px !important; }",
-])
-print("✅ Cell 5B (CSS) loaded!")
+print("✅ Cell 5A-Part 3 loaded cleanly!")
 
 
 with gr.Blocks(title="MGR DOGRA - ENTERPRISE COCKPIT") as demo:
