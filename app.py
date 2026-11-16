@@ -593,33 +593,29 @@ def run_wizard_and_download(url, db, user, pw, selected_label, wiz_map, params_j
     try:
         if not selected_label or selected_label not in wiz_map:
             raise Exception("Please select a valid wizard report first.")
-
         progress(0.10, desc="Authenticating with Odoo...")
-        uid = odoo_jsonrpc(url, "common", "authenticate", [db, user, pw, {}], timeout=60)
+        uid = get_cached_uid(url, db, user, pw) if "get_cached_uid" in globals() else odoo_jsonrpc(url, "common", "authenticate", [db, user, pw, {}], timeout=60)
         opener, clean_base = get_auth_opener(url, db, user, pw)
-
         progress(0.30, desc="Loading wizard context & parameters...")
         w = wiz_map[selected_label]
         wiz_vals = json.loads(params_json) if params_json.strip() else {}
         user_ctx = execute_with_uid(url, db, uid, pw, "res.users", "context_get", [], timeout=45) or {}
-
         progress(0.55, desc=f"Executing '{w['name']}' on Odoo server (please wait)...")
         file_bytes, fname_out, used_method = fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, btn_method, user_ctx, timeout=900)
-
         if not file_bytes:
             raise Exception("Odoo returned an empty file. Check the wizard parameters or required fields.")
-
         progress(0.90, desc="Downloading & saving report file...")
         out_path = os.path.join(tempfile.gettempdir(), fname_out)
         with open(out_path, "wb") as f:
             f.write(file_bytes)
-
         progress(1.0, desc="Done!")
         return f"✅ Successfully generated report ({fname_out})!", out_path
     except Exception as e:
         return f"❌ Generation failed: {str(e)}", None
 
 def disconnect_session():
+    if "UID_CACHE" in globals():
+        UID_CACHE.clear()
     return (
         "",
         "ℹ Session cleared successfully.",
@@ -646,21 +642,14 @@ html, body, .gradio-container, .gradio-container-3-50, #component-0 {
     background-position: center !important;
     color: #f8fafc !important;
 }
-
-.gradio-container * {
-    font-family: 'Segoe UI', -apple-system, sans-serif !important;
-}
-
-.gradio-container .wrap.default,
-.gradio-container .progress-bar-wrap,
-.gradio-container .toast-wrap {
+.gradio-container * { font-family: 'Segoe UI', -apple-system, sans-serif !important; }
+.gradio-container .wrap.default, .gradio-container .progress-bar-wrap, .gradio-container .toast-wrap {
     background: rgba(15, 18, 28, 0.94) !important;
     border: 1px solid rgba(251, 191, 36, 0.5) !important;
     border-radius: 8px !important;
     color: #ffffff !important;
     z-index: 9999 !important;
 }
-
 .gradio-container .progress-level {
     background: rgba(30, 41, 59, 0.85) !important;
     border-radius: 6px !important;
@@ -668,50 +657,31 @@ html, body, .gradio-container, .gradio-container-3-50, #component-0 {
     height: 10px !important;
     border: 1px solid rgba(251, 191, 36, 0.3) !important;
 }
-
-.gradio-container .progress-level-inner,
-.gradio-container .progress-bar,
-.gradio-container progress::-webkit-progress-value {
+.gradio-container .progress-level-inner, .gradio-container .progress-bar, .gradio-container progress::-webkit-progress-value {
     background: linear-gradient(90deg, #d97706 0%, #f59e0b 50%, #fde047 100%) !important;
     background-color: #f59e0b !important;
     height: 100% !important;
 }
-
-.gradio-container .progress-text,
-.gradio-container .meta-text {
-    color: #fcd34d !important;
-    font-weight: 700 !important;
-}
-
-.gradio-container .block,
-.gradio-container .wrap,
-.gradio-container .form,
-.gradio-container .panel,
-.gradio-container div[class*='svelte-'] {
+.gradio-container .progress-text, .gradio-container .meta-text { color: #fcd34d !important; font-weight: 700 !important; }
+.gradio-container .block, .gradio-container .wrap, .gradio-container .form, .gradio-container .panel, .gradio-container div[class*='svelte-'] {
     background: transparent !important;
     background-color: transparent !important;
     border-color: rgba(255, 255, 255, 0.12) !important;
 }
-
-.gradio-container .accordion,
-.gradio-container div[class*='variant-panel'],
-.gradio-container .gr-group {
+.gradio-container .accordion, .gradio-container div[class*='variant-panel'], .gradio-container .gr-group {
     background: rgba(11, 17, 32, 0.86) !important;
     border: 1px solid rgba(56, 189, 248, 0.25) !important;
     border-radius: 12px !important;
     box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4) !important;
     padding: 12px !important;
 }
-
-.gradio-container .accordion > button,
-.gradio-container .label-wrap {
+.gradio-container .accordion > button, .gradio-container .label-wrap {
     background: rgba(15, 23, 42, 0.85) !important;
     color: #38bdf8 !important;
     font-weight: 700 !important;
     border-radius: 8px !important;
     padding: 8px 12px !important;
 }
-
 .gradio-container label span, .gradio-container .form label {
     color: #7dd3fc !important;
     font-weight: 700 !important;
@@ -719,52 +689,34 @@ html, body, .gradio-container, .gradio-container-3-50, #component-0 {
     font-size: 0.8rem !important;
     letter-spacing: 0.6px !important;
 }
-
-.gradio-container input,
-.gradio-container select,
-.gradio-container textarea,
-.gradio-container .secondary-wrap {
+.gradio-container input, .gradio-container select, .gradio-container textarea, .gradio-container .secondary-wrap {
     background: rgba(7, 11, 22, 0.85) !important;
     color: #ffffff !important;
     border: 1px solid rgba(125, 211, 252, 0.3) !important;
     border-radius: 6px !important;
 }
-
 .gradio-container button.primary {
     background: linear-gradient(135deg, #0284c7 0%, #2563eb 100%) !important;
     color: #ffffff !important;
     font-weight: 700 !important;
     border: 1px solid rgba(125, 211, 252, 0.4) !important;
 }
-
 .gradio-container button.secondary {
     background: rgba(15, 23, 42, 0.85) !important;
     color: #e2e8f0 !important;
     font-weight: 600 !important;
     border: 1px solid rgba(148, 163, 184, 0.35) !important;
 }
-
 .gradio-container button.secondary:hover {
     background: rgba(30, 41, 59, 0.95) !important;
     border-color: #38bdf8 !important;
 }
-
 .mechanical-roller {
-    height: 3px;
-    width: 100%;
+    height: 3px; width: 100%;
     background: repeating-linear-gradient(90deg, #38bdf8 0px, #38bdf8 10px, transparent 10px, transparent 20px);
-    margin: 12px 0 0 0;
-    border-radius: 2px;
-    opacity: 0.8;
+    margin: 12px 0 0 0; border-radius: 2px; opacity: 0.8;
 }
-
-.gear-icon {
-    display: inline-block;
-    font-size: 2.2rem;
-    color: #38bdf8;
-    line-height: 1;
-}
-
+.gear-icon { display: inline-block; font-size: 2.2rem; color: #38bdf8; line-height: 1; }
 .glow-banner {
     background: rgba(11, 17, 32, 0.86) !important;
     border-radius: 12px !important;
@@ -773,22 +725,11 @@ html, body, .gradio-container, .gradio-container-3-50, #component-0 {
     text-align: center !important;
     margin-bottom: 1.2rem !important;
 }
-
-.glow-logo {
-    font-weight: 800 !important;
-    font-size: 2.6rem !important;
-    color: #ffffff !important;
-    letter-spacing: 3px !important;
-}
-
-.glow-banner p {
-    font-size: 1rem !important;
-    color: #cbd5e1 !important;
-    margin: 0.4rem 0 0 0 !important;
-    font-weight: 600 !important;
-    letter-spacing: 1.2px !important;
-}
+.glow-logo { font-weight: 800 !important; font-size: 2.6rem !important; color: #ffffff !important; letter-spacing: 3px !important; }
+.glow-banner p { font-size: 1rem !important; color: #cbd5e1 !important; margin: 0.4rem 0 0 0 !important; font-weight: 600 !important; letter-spacing: 1.2px !important; }
 """
+
+print("✅ Cell 4A loaded!")
 
 with gr.Blocks(title="MGR DOGRA - ENTERPRISE COCKPIT") as demo:
     gr.HTML(
@@ -834,11 +775,10 @@ with gr.Blocks(title="MGR DOGRA - ENTERPRISE COCKPIT") as demo:
             in_f1_field = gr.Dropdown(label="Primary Filter Field (e.g. Category / Account)", choices=list())
             in_f1_vals = gr.Dropdown(label="Primary Filter Values", choices=list(), multiselect=True)
             in_f2_field = gr.Dropdown(label="Secondary Filter Field (e.g. Product / Partner)", choices=list())
+            in_f2_vals = gr.Dropdown(label="Secondary Filter Values", choices=list(), multiselect=True)
 
         with gr.Column(scale=6, variant="panel"):
             gr.Markdown("### Active execution console")
-
-
             wiz_details = gr.Markdown("*Choose a report from the sidebar menu to populate details here.*")
             params_editor = gr.Code(label="Auto-Generated Wizard Payload (JSON)", language="json", value="{}", interactive=True)
             btn_method_in = gr.Textbox(label="Odoo Execution Method", value="action_print_report")
@@ -852,15 +792,20 @@ with gr.Blocks(title="MGR DOGRA - ENTERPRISE COCKPIT") as demo:
             download_file = gr.File(label="⌇ Download Output Ledger File Here", interactive=False)
 
     btn_connect.click(connect_and_discover, [in_url, in_db, in_user, in_pass], [status_box, wiz_dropdown, wiz_state])
-    btn_disconnect.click(disconnect_session, list(), [in_pass, status_box, wiz_dropdown, wiz_state, wiz_details, params_editor, in_accounts, acc_state, gen_status, download_file])
+    btn_disconnect.click(disconnect_session, list(), [in_pass, status_box, wiz_dropdown, wiz_state, wiz_details, params_editor, in_f1_field, in_f1_vals, in_f2_field, in_f2_vals, acc_state, gen_status, download_file])
 
-    wiz_dropdown.change(inspect_wizard, [in_url, in_db, in_user, in_pass, wiz_dropdown, wiz_state, in_from_date, in_to_date], [wiz_details, params_editor, btn_method_in, in_as_on, in_accounts, acc_state])
-    btn_load.click(inspect_wizard, [in_url, in_db, in_user, in_pass, wiz_dropdown, wiz_state, in_from_date, in_to_date], [wiz_details, params_editor, btn_method_in, in_as_on, in_accounts, acc_state])
+    wiz_outputs = [wiz_details, params_editor, btn_method_in, in_as_on, in_f1_field, in_f1_vals, in_f2_field, in_f2_vals, acc_state]
+    wiz_dropdown.change(inspect_wizard, [in_url, in_db, in_user, in_pass, wiz_dropdown, wiz_state, in_from_date, in_to_date], wiz_outputs)
+    btn_load.click(inspect_wizard, [in_url, in_db, in_user, in_pass, wiz_dropdown, wiz_state, in_from_date, in_to_date], wiz_outputs)
 
-    for ctrl in [in_from_date, in_to_date, in_as_on, in_accounts]:
-         ctrl.change(sync_ui_to_json, [params_editor, in_from_date, in_to_date, in_as_on, in_accounts, acc_state, wiz_dropdown, wiz_state], [params_editor])
+    in_f1_field.change(on_rel_field_change, [in_f1_field, acc_state], [in_f1_vals])
+    in_f2_field.change(on_rel_field_change, [in_f2_field, acc_state], [in_f2_vals])
 
-    gen_event = btn_generate.click(run_wizard_and_download, [in_url, in_db, in_user, in_pass, wiz_dropdown, wiz_state, params_editor, btn_method_in, in_from_date, in_to_date, in_as_on, in_accounts, acc_state], [gen_status, download_file])
+    sync_inputs = [params_editor, in_from_date, in_to_date, in_as_on, in_f1_field, in_f1_vals, in_f2_field, in_f2_vals, acc_state, wiz_dropdown, wiz_state]
+    for ctrl in [in_from_date, in_to_date, in_as_on, in_f1_vals, in_f2_vals]:
+        ctrl.change(sync_ui_to_json, sync_inputs, [params_editor])
+
+    gen_event = btn_generate.click(run_wizard_and_download, [in_url, in_db, in_user, in_pass, wiz_dropdown, wiz_state, params_editor, btn_method_in], [gen_status, download_file])
     btn_stop.click(stop_generation, list(), [gen_status], cancels=[gen_event])
 
 gr.close_all()
