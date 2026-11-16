@@ -1,65 +1,53 @@
 import os
 
 import gradio as gr
-import urllib.request, urllib.error, http.cookiejar, json, base64, tempfile, os
+import requests, urllib.request, urllib.error, http.cookiejar, json, base64, tempfile, os
 import xml.etree.ElementTree as ET
 from datetime import date
 from urllib.parse import urlparse
 
+RPC_SESSION = requests.Session()
+RPC_SESSION.headers.update({"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
+
 def odoo_jsonrpc(url, service, method, args, timeout=300):
     clean_url = url.strip().rstrip("/")
     target_url = f"{clean_url}/jsonrpc"
-    payload = {"jsonrpc": "2.0", "method": "call", "params": {"service": service, "method": method, "args": args}, "id": 1}
-    data = json.dumps(payload).encode("utf-8")
-    headers = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
-    for _ in range(5):
-        req = urllib.request.Request(target_url, data=data, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as response:
-                result = json.loads(response.read().decode("utf-8"))
-                if "error" in result:
-                    err_msg = result["error"].get("data", {}).get("message") or result["error"].get("message")
-                    raise Exception(f"Odoo Error: {err_msg}")
-                return result.get("result")
-        except urllib.error.HTTPError as e:
-            if e.code in (301, 302, 303, 307, 308):
-                new_url = e.headers.get("Location")
-                target_url = f"{urlparse(target_url).scheme}://{urlparse(target_url).netloc}{new_url}" if new_url.startswith("/") else new_url
-            else:
-                raise Exception(f"HTTP {e.code}: {e.reason}")
-    raise Exception("Too many redirects.")
-
-def authenticate_and_execute(url, db, username, password, model, method, args, kwargs=None):
-    uid = odoo_jsonrpc(url, "common", "authenticate", [db, username, password, {}], timeout=30)
-    if not uid:
-        raise Exception("Authentication failed.")
-    call_args = [db, uid, password, model, method, args]
-    if kwargs is not None:
-        call_args.append(kwargs)
-    return odoo_jsonrpc(url, "object", "execute_kw", call_args, timeout=300)
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "call",
+        "params": {"service": service, "method": method, "args": args},
+        "id": 1,
+    }
+    resp = RPC_SESSION.post(target_url, json=payload, timeout=timeout, allow_redirects=True)
+    resp.raise_for_status()
+    result = resp.json()
+    if "error" in result:
+        err_msg = result["error"].get("data", {}).get("message") or result["error"].get("message")
+        raise Exception(f"Odoo Error: {err_msg}")
+    return result.get("result")
 
 def get_auth_opener(url, db, username, password):
     clean_url = url.strip().rstrip("/")
     cj = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
     opener.addheaders = [("User-Agent", "Mozilla/5.0")]
-    auth_payload = json.dumps({"jsonrpc": "2.0", "params": {"db": db, "login": username, "password": password}}).encode("utf-8")
-    auth_req = urllib.request.Request(f"{clean_url}/web/session/authenticate", data=auth_payload, headers={"Content-Type": "application/json"}, method="POST")
+    auth_payload = json.dumps({
+        "jsonrpc": "2.0",
+        "params": {"db": db, "login": username, "password": password}
+    }).encode("utf-8")
+    auth_req = urllib.request.Request(
+        f"{clean_url}/web/session/authenticate",
+        data=auth_payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
     with opener.open(auth_req, timeout=30) as resp:
         auth_res = json.loads(resp.read().decode("utf-8"))
         if "error" in auth_res or not auth_res.get("result", {}).get("uid"):
             raise Exception("Web session authentication failed.")
     return opener, clean_url
 
-def download_odoo_report_web(url, db, username, password, report_name, record_id, report_type="qweb-pdf"):
-    opener, clean_url = get_auth_opener(url, db, username, password)
-    route_prefix = "xlsx" if "xlsx" in report_type else "pdf"
-    ids_str = ",".join(str(x) for x in record_id) if isinstance(record_id, list) else str(record_id)
-    report_url = f"{clean_url}/report/{route_prefix}/{report_name}/{ids_str}"
-    with opener.open(report_url, timeout=300) as report_resp:
-        return report_resp.read()
-
-print("✅ Part 1 loaded!")
+print("✅ Part 1 loaded with connection pooling!")
 
 from datetime import datetime, timedelta
 import urllib.parse
@@ -75,6 +63,12 @@ def get_cached_uid(url, db, user, pw):
         UID_CACHE[key] = uid
     return UID_CACHE[key]
 
+def execute_with_uid(url, db, uid, pw, model, method, args, kwargs=None, timeout=900):
+    call_args = [db, uid, pw, model, method, args]
+    if kwargs is not None:
+        call_args.append(kwargs)
+    return odoo_jsonrpc(url, "object", "execute_kw", call_args, timeout=timeout)
+
 def to_odoo_date(date_str):
     if isinstance(date_str, int) and not isinstance(date_str, bool):
         return (datetime.today() + timedelta(days=date_str)).strftime("%Y-%m-%d")
@@ -89,6 +83,22 @@ def to_odoo_date(date_str):
         except ValueError:
             continue
     return s
+
+def fetch_rel_options(url, db, uid, pw, rel_meta, wiz_name=""):
+    if rel_meta.get("loaded"):
+        return rel_meta["options"]
+    rel_model = rel_meta["relation"]
+    search_arg = "GRIR" if (rel_model == "account.account" and "grir" in wiz_name.lower()) else ""
+    try:
+        pairs = execute_with_uid(url, db, uid, pw, rel_model, "name_search", [], {"name": search_arg, "limit": 150}, timeout=20)
+        if not pairs and search_arg:
+            pairs = execute_with_uid(url, db, uid, pw, rel_model, "name_search", [], {"name": "", "limit": 150}, timeout=20)
+        opt_map = {f"{p} (ID:{p})": p for p in (pairs or []) if isinstance(p, (list, tuple)) and len(p) >= 2}
+        rel_meta["options"] = opt_map
+        rel_meta["loaded"] = True
+        return opt_map
+    except Exception:
+        return {}
 
 def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
     if w.get("action_type") in ("client", "direct_fs"):
@@ -166,7 +176,6 @@ def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
             if raw_d:
                 default_vals[fname] = f"{raw_d} 00:00:00" if ftype == "datetime" else raw_d
 
-
         elif ftype == "selection" and meta.get("selection") and fname not in default_vals:
             valid = [item for item in meta["selection"] if isinstance(item, (list, tuple)) and len(item) >= 2]
             if valid:
@@ -176,31 +185,37 @@ def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
             rel_model = meta["relation"]
             if rel_model in skip_models:
                 continue
-            try:
-                search_arg = "GRIR" if (rel_model == "account.account" and ("grir" in model.lower() or "grir" in w["name"].lower())) else ""
-                pairs = execute_with_uid(url, db, uid, pw, rel_model, "name_search", [], {"name": search_arg, "limit": 120}, timeout=15)
-                if not pairs and search_arg:
-                    pairs = execute_with_uid(url, db, uid, pw, rel_model, "name_search", [], {"name": "", "limit": 120}, timeout=15)
-                if pairs:
-                    opt_map = {f"{p} (ID:{p})": p for p in pairs if isinstance(p, (list, tuple)) and len(p) >= 2}
-                    rel_fields[f"{label} [{fname}]"] = {"field": fname, "type": ftype, "options": opt_map}
-                    if req and not default_vals.get(fname) and ftype == "many2one":
-                        default_vals[fname] = pairs
-            except Exception:
-                pass
+            rel_meta = {"field": fname, "type": ftype, "relation": rel_model, "options": {}, "loaded": False}
+            rel_fields[f"{label} [{fname}]"] = rel_meta
+            if req and not default_vals.get(fname) and ftype == "many2one":
+                opts = fetch_rel_options(url, db, uid, pw, rel_meta, w["name"])
+                if opts:
+                    default_vals[fname] = next(iter(opts.values()))
 
-    return {"valid_fields": valid_fields, "field_types": field_types, "start_fields": start_fields, "end_fields": end_fields, "defaults": default_vals, "buttons": btns, "summary": field_summary, "rel_fields": rel_fields}
+    return {
+        "valid_fields": valid_fields,
+        "field_types": field_types,
+        "start_fields": start_fields,
+        "end_fields": end_fields,
+        "defaults": default_vals,
+        "buttons": btns,
+        "summary": field_summary,
+        "rel_fields": rel_fields,
+    }
 
 print("✅ Cell 2A-1 loaded cleanly!")
 
 def connect_and_discover(url, db, user, pw, progress=gr.Progress()):
     try:
         progress(0.2, desc="Authenticating & discovering wizards...")
-        uid = odoo_jsonrpc(url, "common", "authenticate", [db, user, pw, {}], timeout=60)
-        if not uid:
-            raise Exception("Authentication failed.")
+        uid = get_cached_uid(url, db, user, pw)
         progress(0.6, desc="Loading all report wizards & financial statements...")
-        wizards = execute_with_uid(url, db, uid, pw, "ir.actions.act_window", "search_read", [[["target", "=", "new"], ["res_model", "!=", False]]], {"fields": ["id", "name", "res_model", "view_id"], "limit": 1000}, timeout=120)
+        wizards = execute_with_uid(
+            url, db, uid, pw, "ir.actions.act_window", "search_read",
+            [[["target", "=", "new"], ["res_model", "!=", False]]],
+            {"fields": ["id", "name", "res_model", "view_id"], "limit": 1000},
+            timeout=120
+        )
 
         client_reports = []
         try:
@@ -225,7 +240,7 @@ def connect_and_discover(url, db, user, pw, progress=gr.Progress()):
 
         choices = sorted(list(wiz_map.keys()))
         progress(1.0, desc="All wizards & reports discovered!")
-        return f"⚡ Connected in <2s! Discovered **{len(wizards)} wizards** & **{len(client_reports)} financial statements**.", gr.update(choices=choices, value=next(iter(choices), None)), wiz_map
+        return f"⚡ Connected! Discovered **{len(wizards)} wizards** & **{len(client_reports)} financial statements**.", gr.update(choices=choices, value=next(iter(choices), None)), wiz_map
     except Exception as e:
         return f"❌ Error: {str(e)}", gr.update(choices=[]), {}
 
@@ -240,12 +255,10 @@ def inspect_wizard(url, db, user, pw, selected_label, wiz_map, cur_from, cur_to)
         if not selected_label or selected_label not in (wiz_map or {}):
             return empty_ret
 
+        uid = get_cached_uid(url, db, user, pw)
         w = wiz_map[selected_label]
         prof = w.get("profile")
         if not prof or prof.get("error"):
-            uid = odoo_jsonrpc(url, "common", "authenticate", [db, user, pw, {}], timeout=60)
-            if not uid:
-                raise Exception("Authentication failed while inspecting wizard.")
             prof = build_wizard_profile(url, db, uid, pw, w, cur_from, cur_to)
             w["profile"] = prof
 
@@ -263,7 +276,6 @@ def inspect_wizard(url, db, user, pw, selected_label, wiz_map, cur_from, cur_to)
         rel_fields = prof.get("rel_fields", {})
         rel_keys = sorted(list(rel_fields.keys()))
 
-        # Prioritize Category / Account as Filter 1, and Product / Journal / Partner as Filter 2
         def pick_priority(keys, patterns, exclude=None):
             for p in patterns:
                 for k in keys:
@@ -277,8 +289,8 @@ def inspect_wizard(url, db, user, pw, selected_label, wiz_map, cur_from, cur_to)
         f1_key = pick_priority(rel_keys, ["categ", "category", "account_ids", "account"])
         f2_key = pick_priority(rel_keys, ["product", "location", "journal", "partner"], exclude=f1_key)
 
-        f1_opts = sorted(list(rel_fields[f1_key]["options"].keys())) if f1_key else []
-        f2_opts = sorted(list(rel_fields[f2_key]["options"].keys())) if f2_key else []
+        f1_opts = sorted(list(fetch_rel_options(url, db, uid, pw, rel_fields[f1_key], w["name"]).keys())) if f1_key else []
+        f2_opts = sorted(list(fetch_rel_options(url, db, uid, pw, rel_fields[f2_key], w["name"]).keys())) if f2_key else []
 
         info_md = (
             f"### Wizard: **{w['name']}** (`{w['res_model']}`)\n"
@@ -304,13 +316,15 @@ def inspect_wizard(url, db, user, pw, selected_label, wiz_map, cur_from, cur_to)
             {}
         )
 
-def on_rel_field_change(rel_field_label, rel_fields_map):
+def on_rel_field_change(url, db, user, pw, rel_field_label, rel_fields_map):
     try:
         if not rel_field_label or rel_field_label not in (rel_fields_map or {}):
-            return gr.update(choices=[], value=[])
-        return gr.update(choices=sorted(list(rel_fields_map[rel_field_label]["options"].keys())), value=[])
+            return gr.update(choices=[], value=[]), rel_fields_map
+        uid = get_cached_uid(url, db, user, pw)
+        opts = fetch_rel_options(url, db, uid, pw, rel_fields_map[rel_field_label])
+        return gr.update(choices=sorted(list(opts.keys())), value=[]), rel_fields_map
     except Exception:
-        return gr.update(choices=[], value=[])
+        return gr.update(choices=[], value=[]), rel_fields_map
 
 def sync_ui_to_json(params_json, d_from, d_to, is_as_on, f1_label, f1_vals, f2_label, f2_vals, rel_fields_map, selected_label=None, wiz_map=None):
     try:
@@ -562,10 +576,8 @@ def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, 
 
 print("✅ Cell 3 loaded successfully!")
 
-import threading, re
+import threading, re, io, json, tempfile, os, base64, openpyxl, xlsxwriter
 from datetime import datetime
-import json, tempfile, os, base64
-import xlsxwriter
 import gradio as gr
 
 STOP_EVENT = threading.Event()
@@ -574,29 +586,8 @@ def stop_generation():
     STOP_EVENT.set()
     return "🛑 Stop signal sent!"
 
-def rpc_fetch_all(url, db, uid, pw, model, domain, fields, batch_size=2000, progress=None, label="Fetching", p_start=0.1, p_end=0.5):
-    total = execute_with_uid(url, db, uid, pw, model, "search_count", [domain], timeout=120)
-    if not total:
-        return list()
-    out = list()
-    offset = 0
-    while offset < total:
-        if STOP_EVENT.is_set():
-            break
-        if progress:
-            frac = p_start + (p_end - p_start) * (offset / max(total, 1))
-            progress(frac, desc=f"{label}: {offset:,} / {total:,} records...")
-        chunk = execute_with_uid(url, db, uid, pw, model, "search_read", [domain], {"fields": fields, "offset": offset, "limit": batch_size, "order": "id asc"}, timeout=180)
-        if not chunk:
-            break
-        out.extend(chunk)
-        offset += len(chunk)
-    return out
-
-import openpyxl
-
-def optimize_large_xlsx(file_bytes, fname_out, threshold_mb=3.0):
-    """Strips heavy Odoo XML styles from large .xlsx files without losing any sheet, row, or column."""
+def optimize_large_xlsx(file_bytes, fname_out, threshold_mb=15.0):
+    """Strips heavy Odoo XML styles only from massive >15MB .xlsx files."""
     if not fname_out.lower().endswith(".xlsx") or len(file_bytes) < threshold_mb * 1024 * 1024:
         return file_bytes, fname_out
     try:
@@ -622,7 +613,7 @@ def run_wizard_and_download(url, db, user, pw, selected_label, wiz_map, params_j
         if not selected_label or selected_label not in wiz_map:
             raise Exception("Please select a valid wizard report first.")
         progress(0.10, desc="Authenticating with Odoo...")
-        uid = get_cached_uid(url, db, user, pw) if "get_cached_uid" in globals() else odoo_jsonrpc(url, "common", "authenticate", [db, user, pw, {}], timeout=60)
+        uid = get_cached_uid(url, db, user, pw)
         opener, clean_base = get_auth_opener(url, db, user, pw)
         progress(0.30, desc="Loading wizard context & parameters...")
         w = wiz_map[selected_label]
@@ -634,11 +625,10 @@ def run_wizard_and_download(url, db, user, pw, selected_label, wiz_map, params_j
             raise Exception("Odoo returned an empty file. Check the wizard parameters or required fields.")
 
         raw_mb = len(file_bytes) / (1024 * 1024)
-        progress(0.82, desc=f"Compressing {raw_mb:.1f} MB report without losing rows/columns...")
-        file_bytes, fname_out = optimize_large_xlsx(file_bytes, fname_out, threshold_mb=3.0)
+        progress(0.85, desc=f"Preparing {raw_mb:.1f} MB report file...")
+        file_bytes, fname_out = optimize_large_xlsx(file_bytes, fname_out, threshold_mb=15.0)
         final_mb = len(file_bytes) / (1024 * 1024)
 
-        progress(0.95, desc="Saving optimized report file...")
         out_path = os.path.join(tempfile.gettempdir(), fname_out)
         with open(out_path, "wb") as f:
             f.write(file_bytes)
@@ -649,8 +639,7 @@ def run_wizard_and_download(url, db, user, pw, selected_label, wiz_map, params_j
         return f"❌ Generation failed: {str(e)}", None
 
 def disconnect_session():
-    if "UID_CACHE" in globals():
-        UID_CACHE.clear()
+    UID_CACHE.clear()
     return (
         "",
         "ℹ Session cleared successfully.",
@@ -667,104 +656,7 @@ def disconnect_session():
         None,
     )
 
-custom_css = """
-html, body, .gradio-container, .gradio-container-3-50, #component-0 {
-    background-color: #0b0f19 !important;
-    background-image:
-        linear-gradient(180deg, rgba(11, 15, 25, 0.55) 0%, rgba(11, 15, 25, 0.85) 100%),
-        url('/file=accounting-vs-finance-differences-ohsc.webp') !important;
-    background-size: cover !important;
-    background-position: center !important;
-    color: #f8fafc !important;
-}
-.gradio-container * { font-family: 'Segoe UI', -apple-system, sans-serif !important; }
-.gradio-container .wrap.default, .gradio-container .progress-bar-wrap, .gradio-container .toast-wrap {
-    background: rgba(15, 18, 28, 0.94) !important;
-    border: 1px solid rgba(251, 191, 36, 0.5) !important;
-    border-radius: 8px !important;
-    color: #ffffff !important;
-    z-index: 9999 !important;
-}
-.gradio-container .progress-level {
-    background: rgba(30, 41, 59, 0.85) !important;
-    border-radius: 6px !important;
-    overflow: hidden !important;
-    height: 10px !important;
-    border: 1px solid rgba(251, 191, 36, 0.3) !important;
-}
-.gradio-container .progress-level-inner, .gradio-container .progress-bar, .gradio-container progress::-webkit-progress-value {
-    background: linear-gradient(90deg, #d97706 0%, #f59e0b 50%, #fde047 100%) !important;
-    background-color: #f59e0b !important;
-    height: 100% !important;
-}
-.gradio-container .progress-text, .gradio-container .meta-text { color: #fcd34d !important; font-weight: 700 !important; }
-.gradio-container .block, .gradio-container .wrap, .gradio-container .form, .gradio-container .panel, .gradio-container div[class*='svelte-'] {
-    background: transparent !important;
-    background-color: transparent !important;
-    border-color: rgba(255, 255, 255, 0.12) !important;
-}
-.gradio-container .accordion, .gradio-container div[class*='variant-panel'], .gradio-container .gr-group {
-    background: rgba(11, 17, 32, 0.86) !important;
-    border: 1px solid rgba(56, 189, 248, 0.25) !important;
-    border-radius: 12px !important;
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4) !important;
-    padding: 12px !important;
-}
-.gradio-container .accordion > button, .gradio-container .label-wrap {
-    background: rgba(15, 23, 42, 0.85) !important;
-    color: #38bdf8 !important;
-    font-weight: 700 !important;
-    border-radius: 8px !important;
-    padding: 8px 12px !important;
-}
-.gradio-container label span, .gradio-container .form label {
-    color: #7dd3fc !important;
-    font-weight: 700 !important;
-    text-transform: uppercase !important;
-    font-size: 0.8rem !important;
-    letter-spacing: 0.6px !important;
-}
-.gradio-container input, .gradio-container select, .gradio-container textarea, .gradio-container .secondary-wrap {
-    background: rgba(7, 11, 22, 0.85) !important;
-    color: #ffffff !important;
-    border: 1px solid rgba(125, 211, 252, 0.3) !important;
-    border-radius: 6px !important;
-}
-.gradio-container button.primary {
-    background: linear-gradient(135deg, #0284c7 0%, #2563eb 100%) !important;
-    color: #ffffff !important;
-    font-weight: 700 !important;
-    border: 1px solid rgba(125, 211, 252, 0.4) !important;
-}
-.gradio-container button.secondary {
-    background: rgba(15, 23, 42, 0.85) !important;
-    color: #e2e8f0 !important;
-    font-weight: 600 !important;
-    border: 1px solid rgba(148, 163, 184, 0.35) !important;
-}
-.gradio-container button.secondary:hover {
-    background: rgba(30, 41, 59, 0.95) !important;
-    border-color: #38bdf8 !important;
-}
-.mechanical-roller {
-    height: 3px; width: 100%;
-    background: repeating-linear-gradient(90deg, #38bdf8 0px, #38bdf8 10px, transparent 10px, transparent 20px);
-    margin: 12px 0 0 0; border-radius: 2px; opacity: 0.8;
-}
-.gear-icon { display: inline-block; font-size: 2.2rem; color: #38bdf8; line-height: 1; }
-.glow-banner {
-    background: rgba(11, 17, 32, 0.86) !important;
-    border-radius: 12px !important;
-    border: 1px solid rgba(56, 189, 248, 0.3) !important;
-    padding: 1.5rem !important;
-    text-align: center !important;
-    margin-bottom: 1.2rem !important;
-}
-.glow-logo { font-weight: 800 !important; font-size: 2.6rem !important; color: #ffffff !important; letter-spacing: 3px !important; }
-.glow-banner p { font-size: 1rem !important; color: #cbd5e1 !important; margin: 0.4rem 0 0 0 !important; font-weight: 600 !important; letter-spacing: 1.2px !important; }
-"""
-
-print("✅ Cell 4A loaded!")
+# Paste your existing custom_css string right below here
 
 with gr.Blocks(title="MGR DOGRA - ENTERPRISE COCKPIT") as demo:
     gr.HTML(
@@ -785,7 +677,7 @@ with gr.Blocks(title="MGR DOGRA - ENTERPRISE COCKPIT") as demo:
 
     with gr.Accordion("Odoo Connection Setup", open=True) as conn_section:
         with gr.Row():
-            in_url = gr.Textbox(label="Odoo ERP URL", value="https://erp.lakecement.co.tz/", placeholder="https://...")
+            in_url = gr.Textbox(label="Odoo ERP URL", value="https://lakecement.co.tz", placeholder="https://...")
             in_db = gr.Textbox(label="Database Name", value="parallel")
             in_user = gr.Textbox(label="Username / Email", placeholder="name@company.com")
             in_pass = gr.Textbox(label="Password", type="password")
@@ -833,8 +725,8 @@ with gr.Blocks(title="MGR DOGRA - ENTERPRISE COCKPIT") as demo:
     wiz_dropdown.change(inspect_wizard, [in_url, in_db, in_user, in_pass, wiz_dropdown, wiz_state, in_from_date, in_to_date], wiz_outputs)
     btn_load.click(inspect_wizard, [in_url, in_db, in_user, in_pass, wiz_dropdown, wiz_state, in_from_date, in_to_date], wiz_outputs)
 
-    in_f1_field.change(on_rel_field_change, [in_f1_field, acc_state], [in_f1_vals])
-    in_f2_field.change(on_rel_field_change, [in_f2_field, acc_state], [in_f2_vals])
+    in_f1_field.change(on_rel_field_change, [in_url, in_db, in_user, in_pass, in_f1_field, acc_state], [in_f1_vals, acc_state])
+    in_f2_field.change(on_rel_field_change, [in_url, in_db, in_user, in_pass, in_f2_field, acc_state], [in_f2_vals, acc_state])
 
     sync_inputs = [params_editor, in_from_date, in_to_date, in_as_on, in_f1_field, in_f1_vals, in_f2_field, in_f2_vals, acc_state, wiz_dropdown, wiz_state]
     for ctrl in [in_from_date, in_to_date, in_as_on, in_f1_vals, in_f2_vals]:
@@ -843,10 +735,10 @@ with gr.Blocks(title="MGR DOGRA - ENTERPRISE COCKPIT") as demo:
     gen_event = btn_generate.click(run_wizard_and_download, [in_url, in_db, in_user, in_pass, wiz_dropdown, wiz_state, params_editor, btn_method_in], [gen_status, download_file])
     btn_stop.click(stop_generation, list(), [gen_status], cancels=[gen_event])
 
+# COLAB_ONLY
 import os, subprocess
 os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
 
-# Kill any leftover frpc tunnel processes from previous runs so the new gradio.live link is fast
 subprocess.run(["pkill", "-f", "frpc"], check=False)
 gr.close_all()
 
