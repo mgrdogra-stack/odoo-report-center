@@ -80,15 +80,15 @@ def to_odoo_date(date_str):
     return s
 
 def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
-    """Inspects only the VISIBLE form fields on Odoo's wizard popup, preserving GRIR/Kardex/Register rules while dynamically mapping all relational fields."""
-    if w.get("action_type") == "client":
+    if w.get("action_type") in ("client", "direct_fs"):
+        btn = "export_to_xlsx" if w.get("action_type") == "client" else "read_group_ledger"
         return {
             "valid_fields": ["date_from", "date_to"],
             "field_types": {"date_from": "date", "date_to": "date"},
             "start_fields": [("date_from", "date")],
             "end_fields": [("date_to", "date")],
             "defaults": {"date_from": to_odoo_date(cur_from), "date_to": to_odoo_date(cur_to)},
-            "buttons": ["export_to_xlsx"],
+            "buttons": [btn],
             "summary": ["- `date_from` (date): From Date", "- `date_to` (date): To Date"],
             "rel_fields": {},
         }
@@ -96,7 +96,6 @@ def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
     model = w["res_model"]
     f_info = execute_with_uid(url, db, uid, pw, model, "fields_get", [], {"attributes": ["string", "type", "relation", "selection", "required", "domain"]}, timeout=60)
     ignore = {"id", "create_uid", "create_date", "write_uid", "write_date", "__last_update", "display_name"}
-
     v_raw = w.get("view_id")
     v_id = next(iter(v_raw), False) if isinstance(v_raw, list) else False
     arch = ""
@@ -114,12 +113,10 @@ def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
         btns = [b.attrib["name"] for b in root.iter("button") if b.attrib.get("name") and b.attrib.get("invisible") != "1"]
         for fld in root.iter("field"):
             fn = fld.attrib.get("name")
-            if fn and fn in f_info and fn not in ignore and fld.attrib.get("invisible") != "1":
-                if fn not in visible_names:
-                    visible_names.append(fn)
+            if fn and fn in f_info and fn not in ignore and fld.attrib.get("invisible") != "1" and fn not in visible_names:
+                visible_names.append(fn)
 
     valid_fields = visible_names if visible_names else [k for k in f_info if k not in ignore and not k.startswith("message_") and f_info[k].get("type") != "binary"]
-
     try:
         default_vals = execute_with_uid(url, db, uid, pw, model, "default_get", [valid_fields], timeout=60) or {}
     except Exception:
@@ -143,33 +140,27 @@ def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
             low_all = f"{fname.lower()} {label.lower()}"
             is_start = any(x in low_all for x in ("from", "start", "begin"))
             (start_fields if is_start else end_fields).append((fname, ftype))
-
-            # Clean any integer offset returned by Odoo's default_get (e.g. 3 -> YYYY-MM-DD)
             if fname in default_vals and default_vals[fname]:
                 clean_def = to_odoo_date(default_vals[fname])
                 if len(clean_def) == 10 and clean_def[4] == "-":
                     default_vals[fname] = f"{clean_def} 00:00:00" if ftype == "datetime" else clean_def
                 else:
                     default_vals[fname] = False
-
             raw_d = to_odoo_date(cur_from) if is_start else to_odoo_date(cur_to)
             if raw_d:
                 default_vals[fname] = f"{raw_d} 00:00:00" if ftype == "datetime" else raw_d
 
         elif ftype == "selection" and meta.get("selection") and fname not in default_vals:
-            valid = [item for item in meta["selection"] if isinstance(item, (list, tuple)) and len(item) >= 2]
+            valid = [item[0] for item in meta["selection"] if isinstance(item, (list, tuple)) and len(item) >= 2]
             if valid:
-                default_vals[fname] = valid[0][0]
+                default_vals[fname] = valid[0]
 
         elif ftype in ("many2one", "many2many") and meta.get("relation"):
             rel_model = meta["relation"]
             if rel_model in ("res.company", "res.currency"):
                 continue
             try:
-                if rel_model == "account.account":
-                    dom = [["name", "ilike", "GRIR"]] if ("grir" in model.lower() or "grir" in w["name"].lower()) else []
-                else:
-                    dom = []
+                dom = [["name", "ilike", "GRIR"]] if (rel_model == "account.account" and ("grir" in model.lower() or "grir" in w["name"].lower())) else []
                 recs = execute_with_uid(url, db, uid, pw, rel_model, "search_read", [dom], {"fields": ["id", "display_name"], "limit": 250}, timeout=30)
                 if not recs and dom:
                     recs = execute_with_uid(url, db, uid, pw, rel_model, "search_read", [[]], {"fields": ["id", "display_name"], "limit": 250}, timeout=30)
@@ -198,40 +189,33 @@ def connect_and_discover(url, db, user, pw, progress=gr.Progress()):
         uid = odoo_jsonrpc(url, "common", "authenticate", [db, user, pw, {}], timeout=60)
         if not uid:
             raise Exception("Authentication failed.")
-
         progress(0.6, desc="Loading all report wizards & financial statements...")
-        wizards = execute_with_uid(
-            url, db, uid, pw, "ir.actions.act_window", "search_read",
-            [[["target", "=", "new"], ["res_model", "!=", False]]],
-            {"fields": ["id", "name", "res_model", "view_id"], "limit": 1000}, timeout=120
-        )
+        wizards = execute_with_uid(url, db, uid, pw, "ir.actions.act_window", "search_read", [[["target", "=", "new"], ["res_model", "!=", False]]], {"fields": ["id", "name", "res_model", "view_id"], "limit": 1000}, timeout=120)
 
         client_reports = []
         try:
-            client_reports = execute_with_uid(
-                url, db, uid, pw, "ir.actions.client", "search_read",
-                [[["tag", "in", ["account_report", "account_report_generic"]]]],
-                {"fields": ["id", "name", "tag", "context", "params"], "limit": 200}, timeout=60
-            )
+            acct_reps = execute_with_uid(url, db, uid, pw, "account.report", "search_read", [[]], {"fields": ["id", "name"], "limit": 200}, timeout=60)
+            for r in acct_reps:
+                client_reports.append({"id": r["id"], "name": r["name"], "action_type": "client", "res_model": "account.report", "context": {"report_id": r["id"]}, "params": {"report_id": r["id"]}})
         except Exception:
             pass
+
+        if not client_reports:
+            client_reports = [
+                {"id": "direct_pnl", "name": "Profit & Loss Statement (Direct Ledger)", "action_type": "direct_fs", "res_model": "account.move.line", "fs_type": "pnl"},
+                {"id": "direct_bs", "name": "Balance Sheet Statement (Direct Ledger)", "action_type": "direct_fs", "res_model": "account.move.line", "fs_type": "bs"},
+            ]
 
         wiz_map = {}
         for w in wizards:
             w["action_type"] = "window"
-            label = f"{w['name']} (Action ID: {w['id']} | {w['res_model']})"
-            wiz_map[label] = w
-
+            wiz_map[f"{w['name']} (Action ID: {w['id']} | {w['res_model']})"] = w
         for c in client_reports:
-            c["action_type"] = "client"
-            c["res_model"] = "account.report"
-            label = f"{c['name']} (Financial Report | ID:{c['id']})"
-            wiz_map[label] = c
+            wiz_map[f"{c['name']} (Financial Statement)"] = c
 
         choices = sorted(list(wiz_map.keys()))
-        first_choice = next(iter(choices), None)
         progress(1.0, desc="All wizards & reports discovered!")
-        return f"⚡ Connected in <2s! Discovered **{len(wizards)} wizards** & **{len(client_reports)} financial reports**. Select any report to load its exact fields.", gr.update(choices=choices, value=first_choice), wiz_map
+        return f"⚡ Connected in <2s! Discovered **{len(wizards)} wizards** & **{len(client_reports)} financial statements**.", gr.update(choices=choices, value=next(iter(choices), None)), wiz_map
     except Exception as e:
         return f"❌ Error: {str(e)}", gr.update(choices=[]), {}
 
@@ -239,7 +223,6 @@ def inspect_wizard(url, db, user, pw, selected_label, wiz_map, cur_from, cur_to)
     empty_ret = ("⚠️ Please select a wizard first.", "{}", "", False, gr.update(choices=[], value=None), gr.update(choices=[], value=[]), {})
     if not selected_label or selected_label not in wiz_map:
         return empty_ret
-
     w = wiz_map[selected_label]
     prof = w.get("profile")
     if not prof or prof.get("error"):
@@ -264,6 +247,7 @@ def inspect_wizard(url, db, user, pw, selected_label, wiz_map, cur_from, cur_to)
     rel_fields = prof.get("rel_fields", {})
     rel_keys = sorted(list(rel_fields.keys()))
     first_rel = next(iter(rel_keys), None)
+    first_opts = sorted(list(rel_fields[first_rel]["options"].keys())) if first_rel else []
 
 
 import pandas as pd
@@ -276,8 +260,95 @@ def execute_with_uid(url, db, uid, pw, model, method, args, kwargs=None, timeout
         call_args.append(kwargs)
     return odoo_jsonrpc(url, "object", "execute_kw", call_args, timeout=timeout)
 
+def build_direct_financial_xlsx(url, db, uid, pw, fs_type, d_from, d_to, user_ctx, timeout=900):
+    acc_fields = execute_with_uid(url, db, uid, pw, "account.account", "fields_get", [], {"attributes": ["type"]}, timeout=60)
+    type_field = "account_type" if "account_type" in acc_fields else ("user_type_id" if "user_type_id" in acc_fields else None)
+    fields_to_read = ["id", "code", "name"] + ([type_field] if type_field else [])
+    accounts = execute_with_uid(url, db, uid, pw, "account.account", "search_read", [[]], {"fields": fields_to_read, "limit": 5000}, timeout=120)
+    acc_map = {a["id"]: a for a in accounts}
+
+    domain = [["parent_state", "=", "posted"]]
+    if fs_type == "pnl":
+        if d_from:
+            domain.append(["date", ">=", d_from])
+        if d_to:
+            domain.append(["date", "<=", d_to])
+    else:
+        if d_to:
+            domain.append(["date", "<=", d_to])
+
+    grouped = execute_with_uid(
+        url, db, uid, pw, "account.move.line", "read_group",
+        [domain, ["account_id", "debit", "credit", "balance"], ["account_id"]],
+        {"lazy": False}, timeout=timeout
+    )
+
+    pnl_keys = ("income", "expense", "cost_of_revenue", "depreciation")
+    bs_keys = ("asset", "liability", "equity", "receivable", "payable", "liquidity", "credit_card")
+
+    rows = []
+    net_earnings = 0.0
+
+    for g in grouped:
+        acc_ref = g.get("account_id")
+        if not acc_ref:
+            continue
+        acc_id = acc_ref[0] if isinstance(acc_ref, (list, tuple)) else acc_ref
+        acc = acc_map.get(acc_id, {})
+        raw_type = acc.get(type_field, "")
+        type_str = raw_type[1] if isinstance(raw_type, (list, tuple)) and len(raw_type) >= 2 else str(raw_type or "")
+        low_t = type_str.lower()
+
+        is_pnl_acc = any(k in low_t for k in pnl_keys)
+        is_bs_acc = any(k in low_t for k in bs_keys)
+
+        debit = float(g.get("debit", 0.0) or 0.0)
+        credit = float(g.get("credit", 0.0) or 0.0)
+        balance = float(g.get("balance", debit - credit) or 0.0)
+
+        if is_pnl_acc:
+            net_earnings += -balance
+
+        if fs_type == "pnl" and not is_pnl_acc:
+            continue
+        if fs_type == "bs" and not is_bs_acc:
+            continue
+
+        display_amt = -balance if any(k in low_t for k in ("income", "liability", "payable", "equity")) else balance
+
+        rows.append({
+            "Account Code": acc.get("code", ""),
+            "Account Name": acc.get("name", str(acc_ref)),
+            "Account Type": type_str,
+            "Debit": round(debit, 2),
+            "Credit": round(credit, 2),
+            "Net Balance": round(display_amt, 2),
+        })
+
+    if fs_type == "bs" and round(net_earnings, 2) != 0.0:
+        rows.append({
+            "Account Code": "999999",
+            "Account Name": "Current Year Unallocated Earnings (Net Profit / Loss)",
+            "Account Type": "equity_unaffected",
+            "Debit": round(max(-net_earnings, 0.0), 2),
+            "Credit": round(max(net_earnings, 0.0), 2),
+            "Net Balance": round(net_earnings, 2),
+        })
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values(by=["Account Type", "Account Code"])
+
+    buf = io.BytesIO()
+    title = "Profit_and_Loss" if fs_type == "pnl" else "Balance_Sheet"
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+        df.to_excel(writer, index=False, sheet_name=title)
+    return buf.getvalue(), f"{title}_{d_to or 'AsOn'}.xlsx", "read_group_ledger"
+
 def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, btn_method, user_ctx, timeout=900):
-    # Support dynamic Financial Reports (Profit & Loss, Balance Sheet)
+    if w.get("action_type") == "direct_fs":
+        return build_direct_financial_xlsx(url, db, uid, pw, w.get("fs_type", "pnl"), wiz_vals.get("date_from"), wiz_vals.get("date_to"), user_ctx, timeout=timeout)
+
     if w.get("action_type") == "client":
         ctx = dict(user_ctx)
         if isinstance(w.get("context"), str):
@@ -300,9 +371,20 @@ def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, 
         with opener.open(dl_url, timeout=timeout) as resp:
             return resp.read(), f"{w['name'].replace(' ', '_')}.xlsx", "export_to_xlsx"
 
-    # Strictly filter wiz_vals to fields that exist on this exact Odoo model
     f_info = execute_with_uid(url, db, uid, pw, w["res_model"], "fields_get", [], {"attributes": ["type"]}, timeout=timeout)
-    safe_vals = {k: v for k, v in wiz_vals.items() if k in f_info}
+    safe_vals = {}
+    for k, v in wiz_vals.items():
+        if k not in f_info:
+            continue
+        ftype = f_info[k].get("type")
+        if ftype in ("date", "datetime") and v:
+            cleaned = to_odoo_date(v)
+            if len(cleaned) >= 10 and cleaned[4] == "-":
+                safe_vals[k] = f"{cleaned[:10]} 00:00:00" if (ftype == "datetime" and len(cleaned) == 10) else cleaned
+            else:
+                safe_vals[k] = False
+        else:
+            safe_vals[k] = v
 
     wiz_id = execute_with_uid(url, db, uid, pw, w["res_model"], "create", [safe_vals], {"context": user_ctx}, timeout=timeout)
 
@@ -622,7 +704,7 @@ with gr.Blocks(title="MGR DOGRA - ENTERPRISE COCKPIT") as demo:
 
     with gr.Accordion("Odoo Connection Setup", open=True) as conn_section:
         with gr.Row():
-            in_url = gr.Textbox(label="Odoo ERP URL", value="https://erp.lakecement.co.tz/", placeholder="https://...")
+            in_url = gr.Textbox(label="Odoo ERP URL", value="https://lakecement.co.tz", placeholder="https://...")
             in_db = gr.Textbox(label="Database Name", value="parallel")
             in_user = gr.Textbox(label="Username / Email", placeholder="name@company.com")
             in_pass = gr.Textbox(label="Password", type="password")
@@ -649,6 +731,7 @@ with gr.Blocks(title="MGR DOGRA - ENTERPRISE COCKPIT") as demo:
 
         with gr.Column(scale=6, variant="panel"):
             gr.Markdown("### Active execution console")
+
 
             wiz_details = gr.Markdown("*Choose a report from the sidebar menu to populate details here.*")
             params_editor = gr.Code(label="Auto-Generated Wizard Payload (JSON)", language="json", value="{}", interactive=True)
