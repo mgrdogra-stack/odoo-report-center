@@ -789,56 +789,114 @@ def run_wizard_and_download(url, db, user, pw, selected_label, wiz_map, params_j
     CURRENT_RUN = run_flag
     t0 = time.time()
     try:
-        if not selected_label or selected_label not in wiz_map:
-            yield "❌ **Please select a valid wizard report first.**", None; return
-        yield make_progress_html(5, "Starting fresh extraction & authenticating...", time.time() - t0), None
+        if not selected_label or selected_label not in (wiz_map or {}):
+            yield "❌ **Please select a valid wizard report first.**", None
+            return
+
+        yield make_progress_html(5, "Authenticating & initializing fresh session...", time.time() - t0), None
         uid = get_cached_uid(url, db, user, pw)
         web_sess, clean_base = create_fresh_web_session(url, db, user, pw)
         user_ctx = get_cached_context(url, db, uid, pw)
-        yield make_progress_html(15, "Preparing wizard parameters...", time.time() - t0), None
+
+        if run_flag["stop"]:
+            yield "🛑 **Request cancelled by user.**", None
+            return
+
+        yield make_progress_html(15, "Validating wizard parameters...", time.time() - t0), None
         w = wiz_map[selected_label]
-        wiz_vals = json.loads(params_json) if params_json.strip() else {}
-        download_stats = {"bytes": 0, "stage": f"Odoo server calculating '{w['name']}'..."}
+        wiz_vals = json.loads(params_json) if (isinstance(params_json, str) and params_json.strip()) else {}
+        download_stats = {
+            "bytes": 0,
+            "chunks_done": 0,
+            "stage": f"Odoo server extracting '{w['name']}'..."
+        }
 
         class LiveStreamOpener:
             def open(self, target_url, timeout=900):
-                download_stats["stage"] = f"Downloading '{w['name']}' from Odoo server..."
-                r = web_sess.get(target_url, timeout=timeout, stream=True); r.raise_for_status()
+                if run_flag["stop"]:
+                    raise Exception("Download cancelled by user.")
+                download_stats["chunks_done"] += 1
+                chunk_no = download_stats["chunks_done"]
+                download_stats["stage"] = f"Downloading '{w['name']}' (Part {chunk_no}) from Odoo..."
+                r = web_sess.get(target_url, timeout=timeout, stream=True)
+                r.raise_for_status()
                 buf = io.BytesIO()
                 for chunk in r.iter_content(chunk_size=524288):
-                    if run_flag["stop"]: raise Exception("Download cancelled by user.")
+                    if run_flag["stop"]:
+                        r.close()
+                        raise Exception("Download cancelled by user.")
                     if chunk:
-                        buf.write(chunk); download_stats["bytes"] += len(chunk)
-                        download_stats["stage"] = f"Receiving file stream: {download_stats['bytes'] / 1048576:.1f} MB downloaded..."
-                buf.seek(0); return buf
+                        buf.write(chunk)
+                        download_stats["bytes"] += len(chunk)
+                        mb = download_stats["bytes"] / 1048576
+                        download_stats["stage"] = f"Receiving data stream (Part {chunk_no}): {mb:.1f} MB downloaded..."
+                buf.seek(0)
+                return buf
 
         pool = ThreadPoolExecutor(max_workers=1)
-        fut = pool.submit(lambda: fetch_single_wizard_fast(url, db, uid, pw, LiveStreamOpener(), clean_base, w, wiz_vals, btn_method, user_ctx, timeout=900))
+        fut = pool.submit(
+            lambda: fetch_single_wizard_fast(
+                url, db, uid, pw, LiveStreamOpener(), clean_base, w, wiz_vals, btn_method, user_ctx, timeout=900
+            )
+        )
         pool.shutdown(wait=False)
+
         while not fut.done():
-            if run_flag["stop"]: yield "🛑 **Request cancelled by user. Click Execute to start again.**", None; return
+            if run_flag["stop"]:
+                yield "🛑 **Request cancelled by user. Click Execute to start again.**", None
+                return
             elapsed = time.time() - t0
-            pct = min(90, 72 + int((download_stats["bytes"] / 1048576) * 0.4)) if download_stats["bytes"] > 0 else min(70, 18 + int((elapsed / (elapsed + 60.0)) * 52))
+            if download_stats["bytes"] > 0:
+                pct = min(90, 70 + int((download_stats["bytes"] / 1048576) * 0.4))
+            else:
+                pct = min(68, 18 + int((elapsed / (elapsed + 45.0)) * 50))
             yield make_progress_html(pct, download_stats["stage"], elapsed), None
-            time.sleep(1.5)
+            time.sleep(1.2)
 
         file_bytes, fname_out, _ = fut.result()
-        if not file_bytes: yield "❌ **Odoo returned an empty file.**", None; return
-        yield make_progress_html(93, "Building Account-by-Account TB Reconciliation sheet...", time.time() - t0), None
+        if not file_bytes:
+            yield "❌ **Odoo returned an empty file.**", None
+            return
+
+        yield make_progress_html(92, "Reconciling against Odoo Trial Balance (TB) & auditing variances...", time.time() - t0), None
         file_bytes, tb_note = append_tb_reconciliation_sheet(file_bytes, fname_out, url, db, uid, pw, w, wiz_vals)
-        yield make_progress_html(98, "Saving final report to disk...", time.time() - t0), None
+
+        yield make_progress_html(98, "Finalizing Excel workbook...", time.time() - t0), None
         out_path = os.path.join(tempfile.gettempdir(), fname_out)
-        with open(out_path, "wb") as f: f.write(file_bytes)
-        yield f"✅ **Completed `{fname_out}`** ({len(file_bytes) / 1048576:.1f} MB) in **{time.time() - t0:.1f}s**!{tb_note}\n\n👉 **Download below** or click **[Direct Browser Download](/file={out_path})**.", out_path
+        with open(out_path, "wb") as f:
+            f.write(file_bytes)
+
+        total_sec = time.time() - t0
+        size_mb = len(file_bytes) / 1048576
+        yield (
+            f"✅ **Completed `{fname_out}`** ({size_mb:.1f} MB) in **{total_sec:.1f}s**!{tb_note}\n\n"
+            f"👉 **Download below** or click **[Direct Browser Download](/file={out_path})**.",
+            out_path,
+        )
     except Exception as e:
         yield f"❌ **Generation failed:** {str(e)}", None
 
 def disconnect_session():
-    CURRENT_RUN["stop"] = True; UID_CACHE.clear(); CTX_CACHE.clear()
-    return ("", "ℹ Session cleared.", gr.update(choices=[], value=None), {}, "*Choose a report from the sidebar.*", "{}", gr.update(choices=[], value=None), gr.update(choices=[], value=[]), gr.update(choices=[], value=None), gr.update(choices=[], value=[]), {}, "**Ready for instructions...**", None)
+    CURRENT_RUN["stop"] = True
+    UID_CACHE.clear()
+    CTX_CACHE.clear()
+    return (
+        "",
+        "ℹ Session cleared.",
+        gr.update(choices=[], value=None),
+        {},
+        "*Choose a report from the sidebar.*",
+        "{}",
+        gr.update(choices=[], value=None),
+        gr.update(choices=[], value=[]),
+        gr.update(choices=[], value=None),
+        gr.update(choices=[], value=[]),
+        {},
+        "**Ready for instructions...**",
+        None,
+    )
 
 print("✅ Cell 5A-Part 3 loaded cleanly!")
-
 
 def extract_account_ids_from_vals(wiz_vals):
     acc_ids = []
