@@ -704,7 +704,7 @@ with gr.Blocks(title="MGR DOGRA - ENTERPRISE COCKPIT") as demo:
 
     with gr.Accordion("Odoo Connection Setup", open=True) as conn_section:
         with gr.Row():
-            in_url = gr.Textbox(label="Odoo ERP URL", value="https://lakecement.co.tz", placeholder="https://...")
+            in_url = gr.Textbox(label="Odoo ERP URL", value="https://erp.lakecement.co.tz/", placeholder="https://...")
             in_db = gr.Textbox(label="Database Name", value="parallel")
             in_user = gr.Textbox(label="Username / Email", placeholder="name@company.com")
             in_pass = gr.Textbox(label="Password", type="password")
