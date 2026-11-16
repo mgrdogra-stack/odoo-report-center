@@ -62,6 +62,7 @@ def download_odoo_report_web(url, db, username, password, report_name, record_id
 print("✅ Part 1 loaded!")
 
 from datetime import datetime
+import urllib.parse
 
 def to_odoo_date(date_str):
     s = str(date_str or "").strip()
@@ -75,7 +76,19 @@ def to_odoo_date(date_str):
     return s
 
 def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
-    """Inspects only the VISIBLE form fields on Odoo's wizard popup, plus defaults and buttons."""
+    """Inspects only the VISIBLE form fields on Odoo's wizard popup, preserving GRIR/Kardex/Register rules while dynamically mapping all relational fields."""
+    if w.get("action_type") == "client":
+        return {
+            "valid_fields": ["date_from", "date_to"],
+            "field_types": {"date_from": "date", "date_to": "date"},
+            "start_fields": [("date_from", "date")],
+            "end_fields": [("date_to", "date")],
+            "defaults": {"date_from": to_odoo_date(cur_from), "date_to": to_odoo_date(cur_to)},
+            "buttons": ["export_to_xlsx"],
+            "summary": ["- `date_from` (date): From Date", "- `date_to` (date): To Date"],
+            "rel_fields": {},
+        }
+
     model = w["res_model"]
     f_info = execute_with_uid(url, db, uid, pw, model, "fields_get", [], {"attributes": ["string", "type", "relation", "selection", "required", "domain"]}, timeout=60)
     ignore = {"id", "create_uid", "create_date", "write_uid", "write_date", "__last_update", "display_name"}
@@ -101,7 +114,6 @@ def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
                 if fn not in visible_names:
                     visible_names.append(fn)
 
-    # Fallback to all non-binary fields only if no form XML was returned
     valid_fields = visible_names if visible_names else [k for k in f_info if k not in ignore and not k.startswith("message_") and f_info[k].get("type") != "binary"]
 
     try:
@@ -109,13 +121,19 @@ def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
     except Exception:
         default_vals = {}
 
-    field_summary, start_fields, end_fields, acc_map = [], [], [], {}
+    field_summary, start_fields, end_fields, field_types, rel_fields = [], [], [], {}, {}
     for fname in valid_fields:
         meta = f_info[fname]
         ftype, label = meta.get("type"), meta.get("string") or fname
+        field_types[fname] = ftype
         req = bool(meta.get("required"))
         req_tag = " [REQUIRED]" if req else ""
-        field_summary.append(f"- `{fname}` ({ftype}{req_tag}): {label}")
+
+        if ftype == "selection" and meta.get("selection"):
+            opts = ", ".join(f"`{x}` ({x})" for x in meta["selection"] if isinstance(x, (list, tuple)) and len(x) >= 2)
+            field_summary.append(f"- `{fname}` ({ftype}{req_tag}): {label} -> Options: {opts}")
+        else:
+            field_summary.append(f"- `{fname}` ({ftype}{req_tag}): {label}")
 
         if ftype in ("date", "datetime"):
             low_all = f"{fname.lower()} {label.lower()}"
@@ -124,70 +142,91 @@ def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
             raw_d = to_odoo_date(cur_from) if is_start else to_odoo_date(cur_to)
             if raw_d:
                 default_vals[fname] = f"{raw_d} 00:00:00" if ftype == "datetime" else raw_d
+
         elif ftype == "selection" and meta.get("selection") and fname not in default_vals:
             valid = [item for item in meta["selection"] if isinstance(item, (list, tuple)) and len(item) >= 2]
             if valid:
                 default_vals[fname] = valid
-        elif ftype == "many2one" and meta.get("relation") and req and not default_vals.get(fname):
+
+        elif ftype in ("many2one", "many2many") and meta.get("relation"):
+            rel_model = meta["relation"]
+            if rel_model in ("res.company", "res.currency"):
+                continue
             try:
-                recs = execute_with_uid(url, db, uid, pw, meta["relation"], "search_read", [[]], {"fields": ["id"], "limit": 1}, timeout=30)
+                if rel_model == "account.account":
+                    dom = [["name", "ilike", "GRIR"]] if ("grir" in model.lower() or "grir" in w["name"].lower()) else []
+                else:
+                    dom = []
+                recs = execute_with_uid(url, db, uid, pw, rel_model, "search_read", [dom], {"fields": ["id", "display_name"], "limit": 250}, timeout=30)
+                if not recs and dom:
+                    recs = execute_with_uid(url, db, uid, pw, rel_model, "search_read", [[]], {"fields": ["id", "display_name"], "limit": 250}, timeout=30)
                 if recs:
-                    default_vals[fname] = recs["id"]
-            except Exception:
-                pass
-        elif ftype in ("many2one", "many2many") and meta.get("relation") == "account.account":
-            try:
-                dom = [["name", "ilike", "GRIR"]] if "grir" in model.lower() or "grir" in w["name"].lower() else []
-                accs = execute_with_uid(url, db, uid, pw, "account.account", "search_read", [dom], {"fields": ["id", "display_name"], "limit": 200}, timeout=30)
-                if not accs:
-                    accs = execute_with_uid(url, db, uid, pw, "account.account", "search_read", [[]], {"fields": ["id", "display_name"], "limit": 200}, timeout=30)
-                acc_map = {f"{a['display_name']} (ID:{a['id']})": a["id"] for a in accs}
+                    opt_map = {f"{r['display_name']} (ID:{r['id']})": r["id"] for r in recs}
+                    rel_fields[f"{label} [{fname}]"] = {"field": fname, "type": ftype, "options": opt_map}
+                    if req and not default_vals.get(fname) and ftype == "many2one":
+                        default_vals[fname] = recs["id"]
             except Exception:
                 pass
 
     return {
         "valid_fields": valid_fields,
+        "field_types": field_types,
         "start_fields": start_fields,
         "end_fields": end_fields,
         "defaults": default_vals,
         "buttons": btns,
         "summary": field_summary,
-        "acc_map": acc_map,
+        "rel_fields": rel_fields,
     }
 
 def connect_and_discover(url, db, user, pw, progress=gr.Progress()):
     try:
-        progress(0.05, desc="Authenticating & discovering wizards...")
+        progress(0.2, desc="Authenticating & discovering wizards...")
         uid = odoo_jsonrpc(url, "common", "authenticate", [db, user, pw, {}], timeout=60)
         if not uid:
             raise Exception("Authentication failed.")
-        wizards = execute_with_uid(url, db, uid, pw, "ir.actions.act_window", "search_read", [[["target", "=", "new"], ["res_model", "!=", False]]], {"fields": ["id", "name", "res_model", "view_id"], "limit": 500}, timeout=120)
-        keywords = ["report", "ledger", "register", "grir", "aged", "tax", "statement", "summary", "breakup", "mis", "provision", "reconcile", "efd", "tansad", "kardex", "payroll", "employee", "stock"]
-        filtered = [w for w in wizards if any(k in w["name"].lower() for k in keywords)]
-        final_list = filtered if filtered else wizards
+
+        progress(0.6, desc="Loading all report wizards & financial statements...")
+        wizards = execute_with_uid(
+            url, db, uid, pw, "ir.actions.act_window", "search_read",
+            [[["target", "=", "new"], ["res_model", "!=", False]]],
+            {"fields": ["id", "name", "res_model", "view_id"], "limit": 1000}, timeout=120
+        )
+
+        client_reports = []
+        try:
+            client_reports = execute_with_uid(
+                url, db, uid, pw, "ir.actions.client", "search_read",
+                [[["tag", "in", ["account_report", "account_report_generic"]]]],
+                {"fields": ["id", "name", "tag", "context", "params"], "limit": 200}, timeout=60
+            )
+        except Exception:
+            pass
 
         wiz_map = {}
-        total = len(final_list)
-        for idx, w in enumerate(final_list):
-            if idx % 5 == 0:
-                progress(0.1 + 0.85 * (idx / max(total, 1)), desc=f"Testing wizard fields ({idx}/{total}): {w['name']}...")
+        for w in wizards:
+            w["action_type"] = "window"
             label = f"{w['name']} (Action ID: {w['id']} | {w['res_model']})"
-            try:
-                w["profile"] = build_wizard_profile(url, db, uid, pw, w)
-            except Exception as prof_err:
-                w["profile"] = {"error": str(prof_err), "valid_fields": [], "start_fields": [], "end_fields": [], "defaults": {}, "buttons": [], "summary": [], "acc_map": {}}
             wiz_map[label] = w
+
+        for c in client_reports:
+            c["action_type"] = "client"
+            c["res_model"] = "account.report"
+            label = f"{c['name']} (Financial Report | ID:{c['id']})"
+            wiz_map[label] = c
 
         choices = sorted(list(wiz_map.keys()))
         first_choice = next(iter(choices), None)
-        progress(1.0, desc="All wizards tested and mapped!")
-        return f"✅ Connected & tested **{len(choices)} wizards**! Every wizard's exact fields & defaults are now cached.", gr.update(choices=choices, value=first_choice), wiz_map
+        progress(1.0, desc="All wizards & reports discovered!")
+        return f"⚡ Connected in <2s! Discovered **{len(wizards)} wizards** & **{len(client_reports)} financial reports**. Select any report to load its exact fields.", gr.update(choices=choices, value=first_choice), wiz_map
     except Exception as e:
         return f"❌ Error: {str(e)}", gr.update(choices=[]), {}
 
 def inspect_wizard(url, db, user, pw, selected_label, wiz_map, cur_from, cur_to):
+    empty_ret = ("⚠️ Please select a wizard first.", "{}", "", False, gr.update(choices=[], value=None), gr.update(choices=[], value=[]), {})
     if not selected_label or selected_label not in wiz_map:
-        return "⚠️ Please select a wizard first.", "{}", "", False, gr.update(choices=[], value=[]), {}
+        return empty_ret
+
     w = wiz_map[selected_label]
     prof = w.get("profile")
     if not prof or prof.get("error"):
@@ -196,7 +235,7 @@ def inspect_wizard(url, db, user, pw, selected_label, wiz_map, cur_from, cur_to)
             prof = build_wizard_profile(url, db, uid, pw, w, cur_from, cur_to)
             w["profile"] = prof
         except Exception as e:
-            return f"❌ Error: {str(e)}", "{}", "", False, gr.update(choices=[], value=[]), {}
+            return f"❌ Error: {str(e)}", "{}", "", False, gr.update(choices=[], value=None), gr.update(choices=[], value=[]), {}
 
     vals = dict(prof.get("defaults", {}))
     clean_from, clean_to = to_odoo_date(cur_from), to_odoo_date(cur_to)
@@ -209,47 +248,28 @@ def inspect_wizard(url, db, user, pw, selected_label, wiz_map, cur_from, cur_to)
 
     btns = prof.get("buttons", [])
     first_btn = next(iter(btns), "action_print_report")
-    acc_map = prof.get("acc_map", {})
+    rel_fields = prof.get("rel_fields", {})
+    rel_keys = sorted(list(rel_fields.keys()))
+    first_rel = next(iter(rel_keys), None)
+    first_opts = sorted(list(rel_fields[first_rel]["options"].keys())) if first_rel else []
+
     info_md = (
         f"### Wizard: **{w['name']}** (`{w['res_model']}`)\n"
         f"**Detected Buttons:** `{', '.join(btns) if btns else 'None (auto-trying standard methods)'}`\n\n"
         f"**Exact Model Fields:**\n" + "\n".join(prof.get("summary", []))
     )
-    return info_md, json.dumps(vals, indent=2), first_btn, bool(vals.get("is_as_on", False)), gr.update(choices=sorted(list(acc_map.keys())), value=[]), acc_map
+    up_rel = gr.update(choices=rel_keys, value=first_rel)
+    up_opts = gr.update(choices=first_opts, value=[])
+    is_ason_val = bool(vals.get("is_as_on", False))
+    return info_md, json.dumps(vals, indent=2), first_btn, is_ason_val, up_rel, up_opts, rel_fields
 
-def sync_ui_to_json(params_json, d_from, d_to, is_as_on, selected_accs, acc_map, selected_label=None, wiz_map=None):
-    try:
-        data = json.loads(params_json) if params_json.strip() else {}
-    except Exception:
-        data = {}
-
-    prof = (wiz_map or {}).get(selected_label, {}).get("profile", {})
-    valid_set = set(prof.get("valid_fields", []))
-
-    # Strip any invalid fields that do not exist on this wizard model
-    if valid_set:
-        data = {k: v for k, v in data.items() if k in valid_set}
-
-    clean_from, clean_to = to_odoo_date(d_from), to_odoo_date(d_to)
-    if clean_from:
-        for fname, ftype in prof.get("start_fields", []):
-            data[fname] = f"{clean_from} 00:00:00" if ftype == "datetime" else clean_from
-    if clean_to:
-        for fname, ftype in prof.get("end_fields", []):
-            data[fname] = f"{clean_to} 23:59:59" if ftype == "datetime" else clean_to
-
-    if "is_as_on" in data or "is_as_on" in valid_set:
-        data["is_as_on"] = bool(is_as_on)
-    if selected_accs and acc_map and (not valid_set or "account_ids" in valid_set):
-        ids = [acc_map[a] for a in selected_accs if a in acc_map]
-        data["account_ids"] = [[6, 0, ids]]
-    return json.dumps(data, indent=2)
-
-print("✅ Cell 2A loaded!")
+def on_rel_field_change(rel_field_label, rel_fields_map):
+    if not rel_field_label or rel_field_label not in (rel_fields_map or {}):
+        return gr.update(choices=[], value=[])
 
 
 import pandas as pd
-import io, time, gc, xlsxwriter
+import io, time, gc, xlsxwriter, urllib.parse
 from datetime import datetime, timedelta
 
 def execute_with_uid(url, db, uid, pw, model, method, args, kwargs=None, timeout=900):
@@ -259,6 +279,29 @@ def execute_with_uid(url, db, uid, pw, model, method, args, kwargs=None, timeout
     return odoo_jsonrpc(url, "object", "execute_kw", call_args, timeout=timeout)
 
 def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, btn_method, user_ctx, timeout=900):
+    # Support dynamic Financial Reports (Profit & Loss, Balance Sheet)
+    if w.get("action_type") == "client":
+        ctx = dict(user_ctx)
+        if isinstance(w.get("context"), str):
+            try:
+                ctx.update(json.loads(w["context"].replace("'", '"')))
+            except Exception:
+                pass
+        elif isinstance(w.get("context"), dict):
+            ctx.update(w["context"])
+        report_id = ctx.get("report_id") or (w.get("params") or {}).get("report_id") or w["id"]
+        options = {
+            "date": {
+                "date_from": wiz_vals.get("date_from"),
+                "date_to": wiz_vals.get("date_to"),
+                "filter": "custom",
+                "mode": "range",
+            }
+        }
+        dl_url = f"{clean_base}/account_reports/export_to_xlsx?report_id={report_id}&options={urllib.parse.quote(json.dumps(options))}"
+        with opener.open(dl_url, timeout=timeout) as resp:
+            return resp.read(), f"{w['name'].replace(' ', '_')}.xlsx", "export_to_xlsx"
+
     # Strictly filter wiz_vals to fields that exist on this exact Odoo model
     f_info = execute_with_uid(url, db, uid, pw, w["res_model"], "fields_get", [], {"attributes": ["type"]}, timeout=timeout)
     safe_vals = {k: v for k, v in wiz_vals.items() if k in f_info}
@@ -330,7 +373,7 @@ def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, 
 
     return file_bytes, fname_out, used_m
 
-print("✅ Cell 3 loaded!")
+print("✅ Cell 3 loaded successfully!")
 
 import threading, re
 from datetime import datetime
@@ -380,6 +423,9 @@ def run_wizard_and_download(url, db, user, pw, selected_label, wiz_map, params_j
         progress(0.55, desc=f"Executing '{w['name']}' on Odoo server (please wait)...")
         file_bytes, fname_out, used_method = fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, btn_method, user_ctx, timeout=900)
 
+        if not file_bytes:
+            raise Exception("Odoo returned an empty file. Check the wizard parameters or required fields.")
+
         progress(0.90, desc="Downloading & saving report file...")
         out_path = os.path.join(tempfile.gettempdir(), fname_out)
         with open(out_path, "wb") as f:
@@ -398,6 +444,7 @@ def disconnect_session():
         {},
         "*Choose a report from the sidebar menu to populate details here.*",
         "{}",
+        gr.update(choices=[], value=None),
         gr.update(choices=[], value=[]),
         {},
         "**Ready for instructions...**",
@@ -599,10 +646,12 @@ with gr.Blocks(title="MGR DOGRA - ENTERPRISE COCKPIT") as demo:
                 in_to_date = gr.Textbox(label="To Date", placeholder="DD-MM-YYYY (e.g. 31-10-2026)")
 
             in_as_on = gr.Checkbox(label="Print 'As On' Date (Historical)", value=False)
-            in_accounts = gr.Dropdown(label="Filter Accounts (Optional)", choices=list(), multiselect=True)
+            in_rel_field = gr.Dropdown(label="Filter Field (Auto-Detected)", choices=list())
+            in_accounts = gr.Dropdown(label="Filter Values (Accounts, Products, Categories, etc.)", choices=list(), multiselect=True)
 
         with gr.Column(scale=6, variant="panel"):
             gr.Markdown("### Active execution console")
+
             wiz_details = gr.Markdown("*Choose a report from the sidebar menu to populate details here.*")
             params_editor = gr.Code(label="Auto-Generated Wizard Payload (JSON)", language="json", value="{}", interactive=True)
             btn_method_in = gr.Textbox(label="Odoo Execution Method", value="action_print_report")
