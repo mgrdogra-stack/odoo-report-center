@@ -218,9 +218,15 @@ def connect_and_discover(url, db, user, pw, progress=gr.Progress()):
         return f"❌ Error: {str(e)}", gr.update(choices=[]), {}
 
 def inspect_wizard(url, db, user, pw, selected_label, wiz_map, cur_from, cur_to):
+    empty_ret = (
+        "⚠️ Please select a wizard first.", "{}", "action_print_report", False,
+        gr.update(choices=[], value=None), gr.update(choices=[], value=[]),
+        gr.update(choices=[], value=None), gr.update(choices=[], value=[]),
+        {}
+    )
     try:
         if not selected_label or selected_label not in (wiz_map or {}):
-            return "⚠️ Please select a wizard first.", "{}", "action_print_report", False, gr.update(choices=[], value=None), gr.update(choices=[], value=[]), {}
+            return empty_ret
 
         w = wiz_map[selected_label]
         prof = w.get("profile")
@@ -244,12 +250,47 @@ def inspect_wizard(url, db, user, pw, selected_label, wiz_map, cur_from, cur_to)
         first_btn = next(iter(btns), "action_print_report")
         rel_fields = prof.get("rel_fields", {})
         rel_keys = sorted(list(rel_fields.keys()))
-        first_rel = next(iter(rel_keys), None)
-        first_opts = sorted(list(rel_fields[first_rel]["options"].keys())) if first_rel else []
-        info_md = f"### Wizard: **{w['name']}** (`{w['res_model']}`)\n**Detected Buttons:** `{', '.join(btns) if btns else 'Auto-detect'}`\n\n**Exact Model Fields:**\n" + "\n".join(prof.get("summary", []))
-        return info_md, json.dumps(vals, indent=2), first_btn, bool(vals.get("is_as_on", False)), gr.update(choices=rel_keys, value=first_rel), gr.update(choices=first_opts, value=[]), rel_fields
+
+        # Prioritize Category / Account as Filter 1, and Product / Journal / Partner as Filter 2
+        def pick_priority(keys, patterns, exclude=None):
+            for p in patterns:
+                for k in keys:
+                    if k != exclude and p in k.lower():
+                        return k
+            for k in keys:
+                if k != exclude:
+                    return k
+            return None
+
+        f1_key = pick_priority(rel_keys, ["categ", "category", "account_ids", "account"])
+        f2_key = pick_priority(rel_keys, ["product", "location", "journal", "partner"], exclude=f1_key)
+
+        f1_opts = sorted(list(rel_fields[f1_key]["options"].keys())) if f1_key else []
+        f2_opts = sorted(list(rel_fields[f2_key]["options"].keys())) if f2_key else []
+
+        info_md = (
+            f"### Wizard: **{w['name']}** (`{w['res_model']}`)\n"
+            f"**Detected Buttons:** `{', '.join(btns) if btns else 'Auto-detect'}`\n\n"
+            f"**Exact Model Fields:**\n" + "\n".join(prof.get("summary", []))
+        )
+        return (
+            info_md,
+            json.dumps(vals, indent=2),
+            first_btn,
+            bool(vals.get("is_as_on", False)),
+            gr.update(choices=rel_keys, value=f1_key),
+            gr.update(choices=f1_opts, value=[]),
+            gr.update(choices=rel_keys, value=f2_key),
+            gr.update(choices=f2_opts, value=[]),
+            rel_fields,
+        )
     except Exception as e:
-        return f"❌ **Wizard Inspection Error:** {str(e)}", "{}", "action_print_report", False, gr.update(choices=[], value=None), gr.update(choices=[], value=[]), {}
+        return (
+            f"❌ **Wizard Inspection Error:** {str(e)}", "{}", "action_print_report", False,
+            gr.update(choices=[], value=None), gr.update(choices=[], value=[]),
+            gr.update(choices=[], value=None), gr.update(choices=[], value=[]),
+            {}
+        )
 
 def on_rel_field_change(rel_field_label, rel_fields_map):
     try:
@@ -259,31 +300,43 @@ def on_rel_field_change(rel_field_label, rel_fields_map):
     except Exception:
         return gr.update(choices=[], value=[])
 
-def sync_ui_to_json(params_json, d_from, d_to, is_as_on, rel_field_label, selected_rel_vals, rel_fields_map, selected_label=None, wiz_map=None):
+def sync_ui_to_json(params_json, d_from, d_to, is_as_on, f1_label, f1_vals, f2_label, f2_vals, rel_fields_map, selected_label=None, wiz_map=None):
     try:
-        data = json.loads(params_json) if (params_json and params_json.strip()) else {}
+        try:
+            data = json.loads(params_json) if (isinstance(params_json, str) and params_json.strip()) else {}
+        except Exception:
+            data = {}
+
+        prof = (wiz_map or {}).get(selected_label, {}).get("profile", {})
+        valid_set = set(prof.get("valid_fields", []))
+        if valid_set:
+            data = {k: v for k, v in data.items() if k in valid_set}
+
+        clean_from, clean_to = to_odoo_date(d_from), to_odoo_date(d_to)
+        if clean_from:
+            for fname, ftype in prof.get("start_fields", []):
+                data[fname] = f"{clean_from} 00:00:00" if ftype == "datetime" else clean_from
+        if clean_to:
+            for fname, ftype in prof.get("end_fields", []):
+                data[fname] = f"{clean_to} 23:59:59" if ftype == "datetime" else clean_to
+
+        if "is_as_on" in data or "is_as_on" in valid_set:
+            data["is_as_on"] = bool(is_as_on)
+
+        for flabel, fvals in [(f1_label, f1_vals), (f2_label, f2_vals)]:
+            if flabel and flabel in (rel_fields_map or {}):
+                meta = rel_fields_map[flabel]
+                fname, ftype, opt_map = meta["field"], meta["type"], meta["options"]
+                if fvals:
+                    ids = [opt_map[v] for v in fvals if v in opt_map]
+                    if ids:
+                        data[fname] = [[6, 0, ids]] if ftype == "many2many" else ids
+                elif fname in data:
+                    data[fname] = [[6, 0, []]] if ftype == "many2many" else False
+
+        return json.dumps(data, indent=2)
     except Exception:
-        data = {}
-    prof = (wiz_map or {}).get(selected_label, {}).get("profile", {})
-    valid_set = set(prof.get("valid_fields", []))
-    if valid_set:
-        data = {k: v for k, v in data.items() if k in valid_set}
-    clean_from, clean_to = to_odoo_date(d_from), to_odoo_date(d_to)
-    if clean_from:
-        for fname, ftype in prof.get("start_fields", []):
-            data[fname] = f"{clean_from} 00:00:00" if ftype == "datetime" else clean_from
-    if clean_to:
-        for fname, ftype in prof.get("end_fields", []):
-            data[fname] = f"{clean_to} 23:59:59" if ftype == "datetime" else clean_to
-    if "is_as_on" in data or "is_as_on" in valid_set:
-        data["is_as_on"] = bool(is_as_on)
-    if rel_field_label and selected_rel_vals and rel_field_label in (rel_fields_map or {}):
-        meta = rel_fields_map[rel_field_label]
-        fname, ftype, opt_map = meta["field"], meta["type"], meta["options"]
-        ids = [opt_map[v] for v in selected_rel_vals if v in opt_map]
-        if ids:
-            data[fname] = [[6, 0, ids]] if ftype == "many2many" else ids
-    return json.dumps(data, indent=2)
+        return params_json if isinstance(params_json, str) else "{}"
 
 print("✅ Cell 2A-2 loaded!")
 
@@ -524,7 +577,7 @@ def rpc_fetch_all(url, db, uid, pw, model, domain, fields, batch_size=2000, prog
         offset += len(chunk)
     return out
 
-def run_wizard_and_download(url, db, user, pw, selected_label, wiz_map, params_json, btn_method, d_from, d_to, is_as_on, selected_accs, acc_map, progress=gr.Progress()):
+def run_wizard_and_download(url, db, user, pw, selected_label, wiz_map, params_json, btn_method, progress=gr.Progress()):
     try:
         if not selected_label or selected_label not in wiz_map:
             raise Exception("Please select a valid wizard report first.")
@@ -562,6 +615,8 @@ def disconnect_session():
         {},
         "*Choose a report from the sidebar menu to populate details here.*",
         "{}",
+        gr.update(choices=[], value=None),
+        gr.update(choices=[], value=[]),
         gr.update(choices=[], value=None),
         gr.update(choices=[], value=[]),
         {},
@@ -742,7 +797,7 @@ with gr.Blocks(title="MGR DOGRA - ENTERPRISE COCKPIT") as demo:
 
     with gr.Accordion("Odoo Connection Setup", open=True) as conn_section:
         with gr.Row():
-            in_url = gr.Textbox(label="Odoo ERP URL", value="https://erp.lakecement.co.tz/", placeholder="https://...")
+            in_url = gr.Textbox(label="Odoo ERP URL", value="https://lakecement.co.tz", placeholder="https://...")
             in_db = gr.Textbox(label="Database Name", value="parallel")
             in_user = gr.Textbox(label="Username / Email", placeholder="name@company.com")
             in_pass = gr.Textbox(label="Password", type="password")
@@ -764,8 +819,9 @@ with gr.Blocks(title="MGR DOGRA - ENTERPRISE COCKPIT") as demo:
                 in_to_date = gr.Textbox(label="To Date", placeholder="DD-MM-YYYY (e.g. 31-10-2026)")
 
             in_as_on = gr.Checkbox(label="Print 'As On' Date (Historical)", value=False)
-            in_rel_field = gr.Dropdown(label="Filter Field (Auto-Detected)", choices=list())
-            in_accounts = gr.Dropdown(label="Filter Values (Accounts, Products, Categories, etc.)", choices=list(), multiselect=True)
+            in_f1_field = gr.Dropdown(label="Primary Filter Field (e.g. Category / Account)", choices=list())
+            in_f1_vals = gr.Dropdown(label="Primary Filter Values", choices=list(), multiselect=True)
+            in_f2_field = gr.Dropdown(label="Secondary Filter Field (e.g. Product / Partner)", choices=list())
 
         with gr.Column(scale=6, variant="panel"):
             gr.Markdown("### Active execution console")
