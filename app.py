@@ -61,13 +61,17 @@ def download_odoo_report_web(url, db, username, password, report_name, record_id
 
 print("✅ Part 1 loaded!")
 
-from datetime import datetime
+from datetime import datetime, timedelta
 import urllib.parse
 
 def to_odoo_date(date_str):
+    if isinstance(date_str, int) and not isinstance(date_str, bool):
+        return (datetime.today() + timedelta(days=date_str)).strftime("%Y-%m-%d")
     s = str(date_str or "").strip()
     if not s:
         return ""
+    if s.lstrip("-").isdigit():
+        return (datetime.today() + timedelta(days=int(s))).strftime("%Y-%m-%d")
     for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d", "%d-%m-%y", "%d/%m/%y"):
         try:
             return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
@@ -130,7 +134,7 @@ def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
         req_tag = " [REQUIRED]" if req else ""
 
         if ftype == "selection" and meta.get("selection"):
-            opts = ", ".join(f"`{x}` ({x})" for x in meta["selection"] if isinstance(x, (list, tuple)) and len(x) >= 2)
+            opts = ", ".join(f"`{x[0]}` ({x[1]})" for x in meta["selection"] if isinstance(x, (list, tuple)) and len(x) >= 2)
             field_summary.append(f"- `{fname}` ({ftype}{req_tag}): {label} -> Options: {opts}")
         else:
             field_summary.append(f"- `{fname}` ({ftype}{req_tag}): {label}")
@@ -139,6 +143,15 @@ def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
             low_all = f"{fname.lower()} {label.lower()}"
             is_start = any(x in low_all for x in ("from", "start", "begin"))
             (start_fields if is_start else end_fields).append((fname, ftype))
+
+            # Clean any integer offset returned by Odoo's default_get (e.g. 3 -> YYYY-MM-DD)
+            if fname in default_vals and default_vals[fname]:
+                clean_def = to_odoo_date(default_vals[fname])
+                if len(clean_def) == 10 and clean_def[4] == "-":
+                    default_vals[fname] = f"{clean_def} 00:00:00" if ftype == "datetime" else clean_def
+                else:
+                    default_vals[fname] = False
+
             raw_d = to_odoo_date(cur_from) if is_start else to_odoo_date(cur_to)
             if raw_d:
                 default_vals[fname] = f"{raw_d} 00:00:00" if ftype == "datetime" else raw_d
@@ -146,7 +159,7 @@ def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
         elif ftype == "selection" and meta.get("selection") and fname not in default_vals:
             valid = [item for item in meta["selection"] if isinstance(item, (list, tuple)) and len(item) >= 2]
             if valid:
-                default_vals[fname] = valid
+                default_vals[fname] = valid[0][0]
 
         elif ftype in ("many2one", "many2many") and meta.get("relation"):
             rel_model = meta["relation"]
@@ -164,7 +177,7 @@ def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
                     opt_map = {f"{r['display_name']} (ID:{r['id']})": r["id"] for r in recs}
                     rel_fields[f"{label} [{fname}]"] = {"field": fname, "type": ftype, "options": opt_map}
                     if req and not default_vals.get(fname) and ftype == "many2one":
-                        default_vals[fname] = recs["id"]
+                        default_vals[fname] = recs[0]["id"]
             except Exception:
                 pass
 
@@ -251,21 +264,6 @@ def inspect_wizard(url, db, user, pw, selected_label, wiz_map, cur_from, cur_to)
     rel_fields = prof.get("rel_fields", {})
     rel_keys = sorted(list(rel_fields.keys()))
     first_rel = next(iter(rel_keys), None)
-    first_opts = sorted(list(rel_fields[first_rel]["options"].keys())) if first_rel else []
-
-    info_md = (
-        f"### Wizard: **{w['name']}** (`{w['res_model']}`)\n"
-        f"**Detected Buttons:** `{', '.join(btns) if btns else 'None (auto-trying standard methods)'}`\n\n"
-        f"**Exact Model Fields:**\n" + "\n".join(prof.get("summary", []))
-    )
-    up_rel = gr.update(choices=rel_keys, value=first_rel)
-    up_opts = gr.update(choices=first_opts, value=[])
-    is_ason_val = bool(vals.get("is_as_on", False))
-    return info_md, json.dumps(vals, indent=2), first_btn, is_ason_val, up_rel, up_opts, rel_fields
-
-def on_rel_field_change(rel_field_label, rel_fields_map):
-    if not rel_field_label or rel_field_label not in (rel_fields_map or {}):
-        return gr.update(choices=[], value=[])
 
 
 import pandas as pd
