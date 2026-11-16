@@ -94,44 +94,49 @@ def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
         }
 
     model = w["res_model"]
-    f_info = execute_with_uid(url, db, uid, pw, model, "fields_get", [], {"attributes": ["string", "type", "relation", "selection", "required", "domain"]}, timeout=60)
+    f_info = execute_with_uid(url, db, uid, pw, model, "fields_get", [], {"attributes": ["string", "type", "relation", "selection", "required"]}, timeout=45)
     ignore = {"id", "create_uid", "create_date", "write_uid", "write_date", "__last_update", "display_name"}
     v_raw = w.get("view_id")
     v_id = next(iter(v_raw), False) if isinstance(v_raw, list) else False
     arch = ""
     try:
-        arch = execute_with_uid(url, db, uid, pw, model, "get_views", [], {"views": [[v_id, "form"]]}, timeout=60).get("views", {}).get("form", {}).get("arch", "")
+        arch = execute_with_uid(url, db, uid, pw, model, "get_views", [], {"views": [[v_id, "form"]]}, timeout=45).get("views", {}).get("form", {}).get("arch", "")
     except Exception:
         try:
-            arch = execute_with_uid(url, db, uid, pw, model, "fields_view_get", [], {"view_id": v_id, "view_type": "form"}, timeout=60).get("arch", "")
+            arch = execute_with_uid(url, db, uid, pw, model, "fields_view_get", [], {"view_id": v_id, "view_type": "form"}, timeout=45).get("arch", "")
         except Exception:
             pass
 
     btns, visible_names = [], []
     if arch:
-        root = ET.fromstring(arch)
-        btns = [b.attrib["name"] for b in root.iter("button") if b.attrib.get("name") and b.attrib.get("invisible") != "1"]
-        for fld in root.iter("field"):
-            fn = fld.attrib.get("name")
-            if fn and fn in f_info and fn not in ignore and fld.attrib.get("invisible") != "1" and fn not in visible_names:
-                visible_names.append(fn)
+        try:
+            root = ET.fromstring(arch)
+            btns = [b.attrib["name"] for b in root.iter("button") if b.attrib.get("name") and b.attrib.get("invisible") != "1"]
+            for fld in root.iter("field"):
+                fn = fld.attrib.get("name")
+                if fn and fn in f_info and fn not in ignore and fld.attrib.get("invisible") != "1" and fn not in visible_names:
+                    visible_names.append(fn)
+        except Exception:
+            pass
 
     valid_fields = visible_names if visible_names else [k for k in f_info if k not in ignore and not k.startswith("message_") and f_info[k].get("type") != "binary"]
     try:
-        default_vals = execute_with_uid(url, db, uid, pw, model, "default_get", [valid_fields], timeout=60) or {}
+        default_vals = execute_with_uid(url, db, uid, pw, model, "default_get", [valid_fields], timeout=45) or {}
     except Exception:
         default_vals = {}
 
     field_summary, start_fields, end_fields, field_types, rel_fields = [], [], [], {}, {}
+    skip_models = {"res.company", "res.currency", "res.users", "ir.attachment", "ir.actions.report"}
+
     for fname in valid_fields:
-        meta = f_info[fname]
+        meta = f_info.get(fname, {})
         ftype, label = meta.get("type"), meta.get("string") or fname
         field_types[fname] = ftype
         req = bool(meta.get("required"))
         req_tag = " [REQUIRED]" if req else ""
 
         if ftype == "selection" and meta.get("selection"):
-            opts = ", ".join(f"`{x[0]}` ({x[1]})" for x in meta["selection"] if isinstance(x, (list, tuple)) and len(x) >= 2)
+            opts = ", ".join(f"`{x}` ({x})" for x in meta["selection"] if isinstance(x, (list, tuple)) and len(x) >= 2)
             field_summary.append(f"- `{fname}` ({ftype}{req_tag}): {label} -> Options: {opts}")
         else:
             field_summary.append(f"- `{fname}` ({ftype}{req_tag}): {label}")
@@ -142,7 +147,7 @@ def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
             (start_fields if is_start else end_fields).append((fname, ftype))
             if fname in default_vals and default_vals[fname]:
                 clean_def = to_odoo_date(default_vals[fname])
-                if len(clean_def) == 10 and clean_def[4] == "-":
+                if len(clean_def) == 10 and clean_def == "-":
                     default_vals[fname] = f"{clean_def} 00:00:00" if ftype == "datetime" else clean_def
                 else:
                     default_vals[fname] = False
@@ -151,37 +156,30 @@ def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
                 default_vals[fname] = f"{raw_d} 00:00:00" if ftype == "datetime" else raw_d
 
         elif ftype == "selection" and meta.get("selection") and fname not in default_vals:
-            valid = [item[0] for item in meta["selection"] if isinstance(item, (list, tuple)) and len(item) >= 2]
+            valid = [item for item in meta["selection"] if isinstance(item, (list, tuple)) and len(item) >= 2]
             if valid:
-                default_vals[fname] = valid[0]
+                default_vals[fname] = valid
 
         elif ftype in ("many2one", "many2many") and meta.get("relation"):
             rel_model = meta["relation"]
-            if rel_model in ("res.company", "res.currency"):
+            if rel_model in skip_models:
                 continue
             try:
                 dom = [["name", "ilike", "GRIR"]] if (rel_model == "account.account" and ("grir" in model.lower() or "grir" in w["name"].lower())) else []
-                recs = execute_with_uid(url, db, uid, pw, rel_model, "search_read", [dom], {"fields": ["id", "display_name"], "limit": 250}, timeout=30)
+                recs = execute_with_uid(url, db, uid, pw, rel_model, "search_read", [dom], {"fields": ["id", "display_name"], "limit": 150}, timeout=20)
                 if not recs and dom:
-                    recs = execute_with_uid(url, db, uid, pw, rel_model, "search_read", [[]], {"fields": ["id", "display_name"], "limit": 250}, timeout=30)
+                    recs = execute_with_uid(url, db, uid, pw, rel_model, "search_read", [[]], {"fields": ["id", "display_name"], "limit": 150}, timeout=20)
                 if recs:
-                    opt_map = {f"{r['display_name']} (ID:{r['id']})": r["id"] for r in recs}
+                    opt_map = {f"{r.get('display_name', r['id'])} (ID:{r['id']})": r["id"] for r in recs}
                     rel_fields[f"{label} [{fname}]"] = {"field": fname, "type": ftype, "options": opt_map}
                     if req and not default_vals.get(fname) and ftype == "many2one":
-                        default_vals[fname] = recs[0]["id"]
+                        default_vals[fname] = recs["id"]
             except Exception:
                 pass
 
-    return {
-        "valid_fields": valid_fields,
-        "field_types": field_types,
-        "start_fields": start_fields,
-        "end_fields": end_fields,
-        "defaults": default_vals,
-        "buttons": btns,
-        "summary": field_summary,
-        "rel_fields": rel_fields,
-    }
+    return {"valid_fields": valid_fields, "field_types": field_types, "start_fields": start_fields, "end_fields": end_fields, "defaults": default_vals, "buttons": btns, "summary": field_summary, "rel_fields": rel_fields}
+
+print("✅ Cell 2A-1 loaded!")
 
 def connect_and_discover(url, db, user, pw, progress=gr.Progress()):
     try:
@@ -220,34 +218,74 @@ def connect_and_discover(url, db, user, pw, progress=gr.Progress()):
         return f"❌ Error: {str(e)}", gr.update(choices=[]), {}
 
 def inspect_wizard(url, db, user, pw, selected_label, wiz_map, cur_from, cur_to):
-    empty_ret = ("⚠️ Please select a wizard first.", "{}", "", False, gr.update(choices=[], value=None), gr.update(choices=[], value=[]), {})
-    if not selected_label or selected_label not in wiz_map:
-        return empty_ret
-    w = wiz_map[selected_label]
-    prof = w.get("profile")
-    if not prof or prof.get("error"):
-        try:
+    try:
+        if not selected_label or selected_label not in (wiz_map or {}):
+            return "⚠️ Please select a wizard first.", "{}", "action_print_report", False, gr.update(choices=[], value=None), gr.update(choices=[], value=[]), {}
+
+        w = wiz_map[selected_label]
+        prof = w.get("profile")
+        if not prof or prof.get("error"):
             uid = odoo_jsonrpc(url, "common", "authenticate", [db, user, pw, {}], timeout=60)
+            if not uid:
+                raise Exception("Authentication failed while inspecting wizard.")
             prof = build_wizard_profile(url, db, uid, pw, w, cur_from, cur_to)
             w["profile"] = prof
-        except Exception as e:
-            return f"❌ Error: {str(e)}", "{}", "", False, gr.update(choices=[], value=None), gr.update(choices=[], value=[]), {}
 
-    vals = dict(prof.get("defaults", {}))
-    clean_from, clean_to = to_odoo_date(cur_from), to_odoo_date(cur_to)
+        vals = dict(prof.get("defaults", {}))
+        clean_from, clean_to = to_odoo_date(cur_from), to_odoo_date(cur_to)
+        if clean_from:
+            for fname, ftype in prof.get("start_fields", []):
+                vals[fname] = f"{clean_from} 00:00:00" if ftype == "datetime" else clean_from
+        if clean_to:
+            for fname, ftype in prof.get("end_fields", []):
+                vals[fname] = f"{clean_to} 23:59:59" if ftype == "datetime" else clean_to
+
+        btns = prof.get("buttons", [])
+        first_btn = next(iter(btns), "action_print_report")
+        rel_fields = prof.get("rel_fields", {})
+        rel_keys = sorted(list(rel_fields.keys()))
+        first_rel = next(iter(rel_keys), None)
+        first_opts = sorted(list(rel_fields[first_rel]["options"].keys())) if first_rel else []
+        info_md = f"### Wizard: **{w['name']}** (`{w['res_model']}`)\n**Detected Buttons:** `{', '.join(btns) if btns else 'Auto-detect'}`\n\n**Exact Model Fields:**\n" + "\n".join(prof.get("summary", []))
+        return info_md, json.dumps(vals, indent=2), first_btn, bool(vals.get("is_as_on", False)), gr.update(choices=rel_keys, value=first_rel), gr.update(choices=first_opts, value=[]), rel_fields
+    except Exception as e:
+        return f"❌ **Wizard Inspection Error:** {str(e)}", "{}", "action_print_report", False, gr.update(choices=[], value=None), gr.update(choices=[], value=[]), {}
+
+def on_rel_field_change(rel_field_label, rel_fields_map):
+    try:
+        if not rel_field_label or rel_field_label not in (rel_fields_map or {}):
+            return gr.update(choices=[], value=[])
+        return gr.update(choices=sorted(list(rel_fields_map[rel_field_label]["options"].keys())), value=[])
+    except Exception:
+        return gr.update(choices=[], value=[])
+
+def sync_ui_to_json(params_json, d_from, d_to, is_as_on, rel_field_label, selected_rel_vals, rel_fields_map, selected_label=None, wiz_map=None):
+    try:
+        data = json.loads(params_json) if (params_json and params_json.strip()) else {}
+    except Exception:
+        data = {}
+    prof = (wiz_map or {}).get(selected_label, {}).get("profile", {})
+    valid_set = set(prof.get("valid_fields", []))
+    if valid_set:
+        data = {k: v for k, v in data.items() if k in valid_set}
+    clean_from, clean_to = to_odoo_date(d_from), to_odoo_date(d_to)
     if clean_from:
         for fname, ftype in prof.get("start_fields", []):
-            vals[fname] = f"{clean_from} 00:00:00" if ftype == "datetime" else clean_from
+            data[fname] = f"{clean_from} 00:00:00" if ftype == "datetime" else clean_from
     if clean_to:
         for fname, ftype in prof.get("end_fields", []):
-            vals[fname] = f"{clean_to} 23:59:59" if ftype == "datetime" else clean_to
+            data[fname] = f"{clean_to} 23:59:59" if ftype == "datetime" else clean_to
+    if "is_as_on" in data or "is_as_on" in valid_set:
+        data["is_as_on"] = bool(is_as_on)
+    if rel_field_label and selected_rel_vals and rel_field_label in (rel_fields_map or {}):
+        meta = rel_fields_map[rel_field_label]
+        fname, ftype, opt_map = meta["field"], meta["type"], meta["options"]
+        ids = [opt_map[v] for v in selected_rel_vals if v in opt_map]
+        if ids:
+            data[fname] = [[6, 0, ids]] if ftype == "many2many" else ids
+    return json.dumps(data, indent=2)
 
-    btns = prof.get("buttons", [])
-    first_btn = next(iter(btns), "action_print_report")
-    rel_fields = prof.get("rel_fields", {})
-    rel_keys = sorted(list(rel_fields.keys()))
-    first_rel = next(iter(rel_keys), None)
-    first_opts = sorted(list(rel_fields[first_rel]["options"].keys())) if first_rel else []
+print("✅ Cell 2A-2 loaded!")
 
 
 import pandas as pd
