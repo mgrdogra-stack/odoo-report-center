@@ -840,6 +840,20 @@ def disconnect_session():
 print("✅ Cell 5A-Part 3 loaded cleanly!")
 
 
+def extract_account_ids_from_vals(wiz_vals):
+    acc_ids = []
+    for k, v in (wiz_vals or {}).items():
+        if "account" in k.lower() and v:
+            if isinstance(v, int) and not isinstance(v, bool):
+                acc_ids.append(v)
+            elif isinstance(v, list):
+                for item in v:
+                    if isinstance(item, list) and len(item) >= 3 and item[0] == 6 and isinstance(item[2], list):
+                        acc_ids.extend([x for x in item[2] if isinstance(x, int)])
+                    elif isinstance(item, int):
+                        acc_ids.append(item)
+    return list(set(acc_ids))
+
 # ADDITIVE MODULE: Fast TB-Exact Single Reports (GRIR, Purchase Register, Sales Register, Kardex / Inventory)
 # Wraps existing connect_and_discover and fetch_single_wizard_fast without modifying any existing cells.
 
@@ -1029,6 +1043,33 @@ def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, 
 
 print("✅ Fast TB-Exact Single Reports (GRIR, Purchase, Sales, Kardex) attached cleanly!")
 
+custom_css = """
+.glow-banner {
+    background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+    border: 1px solid rgba(251, 191, 36, 0.4);
+    border-radius: 12px;
+    padding: 20px;
+    text-align: center;
+    margin-bottom: 16px;
+}
+.glow-logo {
+    font-size: 28px;
+    font-weight: 800;
+    color: #fbbf24;
+    letter-spacing: 3px;
+    text-shadow: 0 0 12px rgba(251, 191, 36, 0.6);
+}
+.gear-icon {
+    font-size: 24px;
+    color: #38bdf8;
+}
+.glow-banner p {
+    color: #cbd5e1;
+    font-size: 12px;
+    letter-spacing: 2px;
+    margin-top: 6px;
+}
+"""
 with gr.Blocks(title="MGR DOGRA - ENTERPRISE COCKPIT") as demo:
     gr.HTML(
         """
@@ -1111,8 +1152,6 @@ os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
 
 subprocess.run(["pkill", "-f", "frpc"], check=False)
 gr.close_all()
-
-
 
 
 if __name__ == "__main__":
