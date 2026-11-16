@@ -622,8 +622,8 @@ def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, 
 
 print("✅ Cell 3 loaded successfully!")
 
-import threading, re, io, json, tempfile, os, base64, openpyxl, xlsxwriter, requests, time
-from datetime import datetime, timedelta
+import threading, re, io, json, tempfile, os, base64, requests, time
+from datetime import datetime
 import gradio as gr
 
 STOP_EVENT = threading.Event()
@@ -655,145 +655,53 @@ def get_cached_context(url, db, uid, pw):
         CTX_CACHE[key] = execute_with_uid(url, db, uid, pw, "res.users", "context_get", [], timeout=45) or {}
     return CTX_CACHE[key]
 
-def split_date_chunks(d_from_str, d_to_str, chunk_days=60):
-    try:
-        dt1 = datetime.strptime(str(d_from_str)[:10], "%Y-%m-%d")
-        dt2 = datetime.strptime(str(d_to_str)[:10], "%Y-%m-%d")
-        if (dt2 - dt1).days <= 90:
-            return [(str(d_from_str)[:10], str(d_to_str)[:10])]
-        chunks = []
-        cur = dt1
-        while cur <= dt2:
-            nxt = min(cur + timedelta(days=chunk_days - 1), dt2)
-            chunks.append((cur.strftime("%Y-%m-%d"), nxt.strftime("%Y-%m-%d")))
-            cur = nxt + timedelta(days=1)
-        return chunks
-    except Exception:
-        return [(d_from_str, d_to_str)]
-
-def merge_xlsx_chunks(byte_list):
-    wb_out = openpyxl.Workbook(write_only=True)
-    ws_out = wb_out.create_sheet(title="Merged_Report")
-    header_written = False
-    for b in byte_list:
-        wb_in = openpyxl.load_workbook(io.BytesIO(b), read_only=True, data_only=True)
-        ws_in = wb_in[wb_in.sheetnames[0]]
-        for idx, row in enumerate(ws_in.iter_rows(values_only=True)):
-            if idx == 0 and header_written:
-                continue
-            ws_out.append(list(row))
-        header_written = True
-        wb_in.close()
-    out_buf = io.BytesIO()
-    wb_out.save(out_buf)
-    return out_buf.getvalue()
-
-def optimize_large_xlsx(file_bytes, fname_out, threshold_mb=15.0):
-    if not fname_out.lower().endswith(".xlsx") or len(file_bytes) < threshold_mb * 1024 * 1024:
-        return file_bytes, fname_out
-    try:
-        wb_in = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
-        wb_out = openpyxl.Workbook(write_only=True)
-        for sheet_name in wb_in.sheetnames:
-            ws_in = wb_in[sheet_name]
-            ws_out = wb_out.create_sheet(title=sheet_name)
-            for row in ws_in.iter_rows(values_only=True):
-                ws_out.append(list(row))
-        wb_in.close()
-        out_buf = io.BytesIO()
-        wb_out.save(out_buf)
-        slim_bytes = out_buf.getvalue()
-        if len(slim_bytes) < len(file_bytes):
-            return slim_bytes, fname_out
-    except Exception:
-        pass
-    return file_bytes, fname_out
-
 def run_wizard_and_download(url, db, user, pw, selected_label, wiz_map, params_json, btn_method, progress=gr.Progress()):
     STOP_EVENT.clear()
     t0 = time.time()
     try:
         if not selected_label or selected_label not in wiz_map:
             raise Exception("Please select a valid wizard report first.")
-        progress(0.08, desc="Connecting with cached session...")
+        progress(0.10, desc="Connecting with cached session...")
         uid = get_cached_uid(url, db, user, pw)
         web_sess, clean_base = get_cached_web_session(url, db, user, pw)
         user_ctx = get_cached_context(url, db, uid, pw)
 
-        class FastOpener:
+        class FastStreamOpener:
             def open(self, target_url, timeout=900):
-                r = web_sess.get(target_url, timeout=timeout)
+                r = web_sess.get(target_url, timeout=timeout, stream=True)
                 r.raise_for_status()
-                return io.BytesIO(r.content)
+                buf = io.BytesIO()
+                for chunk in r.iter_content(chunk_size=1048576):
+                    if STOP_EVENT.is_set():
+                        raise Exception("Download cancelled by user.")
+                    if chunk:
+                        buf.write(chunk)
+                buf.seek(0)
+                return buf
 
         w = wiz_map[selected_label]
         wiz_vals = json.loads(params_json) if params_json.strip() else {}
-        prof = w.get("profile", {})
-        start_f = prof.get("start_fields", [])
-        end_f = prof.get("end_fields", [])
 
-        # Check if we should auto-chunk a wide date range (>90 days) to prevent 502 timeouts
-        chunks = None
-        if start_f and end_f and not wiz_vals.get("is_as_on") and w.get("action_type") == "window":
-            s_name, s_type = start_f[0]
-            e_name, e_type = end_f[0]
-            if wiz_vals.get(s_name) and wiz_vals.get(e_name):
-                date_pairs = split_date_chunks(wiz_vals[s_name], wiz_vals[e_name], chunk_days=60)
-                if len(date_pairs) > 1:
-                    chunks = (s_name, s_type, e_name, e_type, date_pairs)
-
-        if chunks:
-            s_name, s_type, e_name, e_type, date_pairs = chunks
-            chunk_bytes_list = []
-            fname_out = f"{w['name'].replace(' ', '_')}.xlsx"
-            for i, (c_from, c_to) in enumerate(date_pairs):
-                if STOP_EVENT.is_set():
-                    raise Exception("Cancelled by user.")
-                frac = 0.15 + 0.70 * (i / len(date_pairs))
-                progress(frac, desc=f"Fetching batch {i+1}/{len(date_pairs)} ({c_from} to {c_to})...")
-                sub_vals = dict(wiz_vals)
-                sub_vals[s_name] = f"{c_from} 00:00:00" if s_type == "datetime" else c_from
-                sub_vals[e_name] = f"{c_to} 23:59:59" if e_type == "datetime" else c_to
-                b_out, f_out, _ = fetch_single_wizard_fast(
-                    url, db, uid, pw, FastOpener(), clean_base, w, sub_vals, btn_method, user_ctx, timeout=900
-                )
-                if b_out:
-                    if not f_out.lower().endswith(".xlsx"):
-                        # Non-Excel (PDF/HTML) cannot be row-merged; fall back to single full call
-                        chunk_bytes_list = []
-                        break
-                    chunk_bytes_list.append(b_out)
-                    fname_out = f_out
-
-            if chunk_bytes_list:
-                progress(0.90, desc=f"Merging {len(chunk_bytes_list)} batches into one Excel file...")
-                file_bytes = merge_xlsx_chunks(chunk_bytes_list)
-            else:
-                progress(0.45, desc=f"Executing '{w['name']}' on Odoo server...")
-                file_bytes, fname_out, _ = fetch_single_wizard_fast(
-                    url, db, uid, pw, FastOpener(), clean_base, w, wiz_vals, btn_method, user_ctx, timeout=900
-                )
-        else:
-            progress(0.40, desc=f"Waiting for Odoo server to build '{w['name']}'...")
-            file_bytes, fname_out, _ = fetch_single_wizard_fast(
-                url, db, uid, pw, FastOpener(), clean_base, w, wiz_vals, btn_method, user_ctx, timeout=900
-            )
+        progress(0.30, desc=f"Odoo server is generating exact '{w['name']}' report (single query, TB-accurate)...")
+        file_bytes, fname_out, _ = fetch_single_wizard_fast(
+            url, db, uid, pw, FastStreamOpener(), clean_base, w, wiz_vals, btn_method, user_ctx, timeout=900
+        )
 
         if not file_bytes:
             raise Exception("Odoo returned an empty file. Check the wizard parameters or required fields.")
 
-        raw_mb = len(file_bytes) / (1024 * 1024)
-        progress(0.95, desc=f"Saving {raw_mb:.1f} MB report file...")
-        file_bytes, fname_out = optimize_large_xlsx(file_bytes, fname_out, threshold_mb=15.0)
         final_mb = len(file_bytes) / (1024 * 1024)
-
         out_path = os.path.join(tempfile.gettempdir(), fname_out)
         with open(out_path, "wb") as f:
             f.write(file_bytes)
+
         elapsed = time.time() - t0
         progress(1.0, desc="Done!")
-        size_note = f"{raw_mb:.1f} MB → {final_mb:.1f} MB" if raw_mb > final_mb + 0.5 else f"{final_mb:.1f} MB"
-        return f"✅ Generated **{fname_out}** ({size_note}) in **{elapsed:.1f}s**!", out_path
+        return (
+            f"✅ Generated **{fname_out}** ({final_mb:.1f} MB, exact Odoo output & formatting) in **{elapsed:.1f}s**!\n\n"
+            f"👉 **Download below** or click **[Direct Browser Download](/file={out_path})**.",
+            out_path,
+        )
     except Exception as e:
         return f"❌ Generation failed: {str(e)}", None
 
@@ -847,9 +755,74 @@ html, body, .gradio-container, .gradio-container-3-50, #component-0 {
     background-color: #f59e0b !important;
     height: 100% !important;
 }
+.gradio-container .progress-text, .gradio-container .meta-text { color: #fcd34d !important; font-weight: 700 !important; }
+.gradio-container .block, .gradio-container .wrap, .gradio-container .form, .gradio-container .panel, .gradio-container div[class*='svelte-'] {
+    background: transparent !important;
+    background-color: transparent !important;
+    border-color: rgba(255, 255, 255, 0.12) !important;
+}
+.gradio-container .accordion, .gradio-container div[class*='variant-panel'], .gradio-container .gr-group {
+    background: rgba(11, 17, 32, 0.86) !important;
+    border: 1px solid rgba(56, 189, 248, 0.25) !important;
+    border-radius: 12px !important;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4) !important;
+    padding: 12px !important;
+}
+.gradio-container .accordion > button, .gradio-container .label-wrap {
+    background: rgba(15, 23, 42, 0.85) !important;
+    color: #38bdf8 !important;
+    font-weight: 700 !important;
+    border-radius: 8px !important;
+    padding: 8px 12px !important;
+}
+.gradio-container label span, .gradio-container .form label {
+    color: #7dd3fc !important;
+    font-weight: 700 !important;
+    text-transform: uppercase !important;
+    font-size: 0.8rem !important;
+    letter-spacing: 0.6px !important;
+}
+.gradio-container input, .gradio-container select, .gradio-container textarea, .gradio-container .secondary-wrap {
+    background: rgba(7, 11, 22, 0.85) !important;
+    color: #ffffff !important;
+    border: 1px solid rgba(125, 211, 252, 0.3) !important;
+    border-radius: 6px !important;
+}
+.gradio-container button.primary {
+    background: linear-gradient(135deg, #0284c7 0%, #2563eb 100%) !important;
+    color: #ffffff !important;
+    font-weight: 700 !important;
+    border: 1px solid rgba(125, 211, 252, 0.4) !important;
+}
+.gradio-container button.secondary {
+    background: rgba(15, 23, 42, 0.85) !important;
+    color: #e2e8f0 !important;
+    font-weight: 600 !important;
+    border: 1px solid rgba(148, 163, 184, 0.35) !important;
+}
+.gradio-container button.secondary:hover {
+    background: rgba(30, 41, 59, 0.95) !important;
+    border-color: #38bdf8 !important;
+}
+.mechanical-roller {
+    height: 3px; width: 100%;
+    background: repeating-linear-gradient(90deg, #38bdf8 0px, #38bdf8 10px, transparent 10px, transparent 20px);
+    margin: 12px 0 0 0; border-radius: 2px; opacity: 0.8;
+}
+.gear-icon { display: inline-block; font-size: 2.2rem; color: #38bdf8; line-height: 1; }
+.glow-banner {
+    background: rgba(11, 17, 32, 0.86) !important;
+    border-radius: 12px !important;
+    border: 1px solid rgba(56, 189, 248, 0.3) !important;
+    padding: 1.5rem !important;
+    text-align: center !important;
+    margin-bottom: 1.2rem !important;
+}
+.glow-logo { font-weight: 800 !important; font-size: 2.6rem !important; color: #ffffff !important; letter-spacing: 3px !important; }
+.glow-banner p { font-size: 1rem !important; color: #cbd5e1 !important; margin: 0.4rem 0 0 0 !important; font-weight: 600 !important; letter-spacing: 1.2px !important; }
 """
 
-print("✅ Cell 5 loaded with auto-chunking, session caching & custom_css!")
+print("✅ Cell 5 finalized: Single exact Odoo query, TB-accurate, zero chunking!")
 
 with gr.Blocks(title="MGR DOGRA - ENTERPRISE COCKPIT") as demo:
     gr.HTML(
@@ -933,8 +906,6 @@ os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
 
 subprocess.run(["pkill", "-f", "frpc"], check=False)
 gr.close_all()
-
-
 
 
 if __name__ == "__main__":
