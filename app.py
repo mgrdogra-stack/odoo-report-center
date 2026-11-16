@@ -1,10 +1,11 @@
 import os
 
 import gradio as gr
-import requests, urllib.request, urllib.error, http.cookiejar, json, base64, tempfile, os
+import requests, urllib.request, urllib.error, http.cookiejar, json, base64, tempfile, os, time
 import xml.etree.ElementTree as ET
 from datetime import date
 from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor
 
 RPC_SESSION = requests.Session()
 RPC_SESSION.headers.update({"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
@@ -18,13 +19,19 @@ def odoo_jsonrpc(url, service, method, args, timeout=300):
         "params": {"service": service, "method": method, "args": args},
         "id": 1,
     }
-    resp = RPC_SESSION.post(target_url, json=payload, timeout=timeout, allow_redirects=True)
-    resp.raise_for_status()
-    result = resp.json()
-    if "error" in result:
-        err_msg = result["error"].get("data", {}).get("message") or result["error"].get("message")
-        raise Exception(f"Odoo Error: {err_msg}")
-    return result.get("result")
+    for attempt in range(2):
+        resp = RPC_SESSION.post(target_url, json=payload, timeout=timeout, allow_redirects=True)
+        if resp.status_code in (502, 503, 504) and attempt == 0:
+            time.sleep(2)
+            continue
+        if resp.status_code in (502, 503, 504):
+            raise Exception(f"Odoo Server Proxy Timeout (HTTP {resp.status_code}). Try a shorter date range or add filters.")
+        resp.raise_for_status()
+        result = resp.json()
+        if "error" in result:
+            err_msg = result["error"].get("data", {}).get("message") or result["error"].get("message")
+            raise Exception(f"Odoo Error: {err_msg}")
+        return result.get("result")
 
 def get_auth_opener(url, db, username, password):
     clean_url = url.strip().rstrip("/")
@@ -47,12 +54,31 @@ def get_auth_opener(url, db, username, password):
             raise Exception("Web session authentication failed.")
     return opener, clean_url
 
-print("✅ Part 1 loaded with connection pooling!")
+print("✅ Part 1 loaded with connection pooling & retry!")
 
 from datetime import datetime, timedelta
 import urllib.parse
 
 UID_CACHE = {}
+CACHE_FILE = os.path.join(tempfile.gettempdir(), "odoo_wizard_cache.json")
+
+def load_disk_cache():
+    try:
+        if os.path.exists(CACHE_FILE):
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def save_disk_cache(cache_dict):
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache_dict, f)
+    except Exception:
+        pass
+
+PROFILE_CACHE = load_disk_cache()
 
 def get_cached_uid(url, db, user, pw):
     key = (url.strip().rstrip("/"), db.strip(), user.strip(), pw)
@@ -93,7 +119,7 @@ def fetch_rel_options(url, db, uid, pw, rel_meta, wiz_name=""):
         pairs = execute_with_uid(url, db, uid, pw, rel_model, "name_search", [], {"name": search_arg, "limit": 150}, timeout=20)
         if not pairs and search_arg:
             pairs = execute_with_uid(url, db, uid, pw, rel_model, "name_search", [], {"name": "", "limit": 150}, timeout=20)
-        opt_map = {f"{p} (ID:{p})": p for p in (pairs or []) if isinstance(p, (list, tuple)) and len(p) >= 2}
+        opt_map = {f"{p[1]} (ID:{p[0]})": p[0] for p in (pairs or []) if isinstance(p, (list, tuple)) and len(p) >= 2}
         rel_meta["options"] = opt_map
         rel_meta["loaded"] = True
         return opt_map
@@ -114,19 +140,33 @@ def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
             "rel_fields": {},
         }
 
+    cache_key = f"{url.strip().rstrip('/')}|{db}|{w['res_model']}|{w.get('id')}"
+    if cache_key in PROFILE_CACHE:
+        return json.loads(json.dumps(PROFILE_CACHE[cache_key]))
+
     model = w["res_model"]
-    f_info = execute_with_uid(url, db, uid, pw, model, "fields_get", [], {"attributes": ["string", "type", "relation", "selection", "required"]}, timeout=45)
     ignore = {"id", "create_uid", "create_date", "write_uid", "write_date", "__last_update", "display_name"}
     v_raw = w.get("view_id")
     v_id = next(iter(v_raw), False) if isinstance(v_raw, list) else False
-    arch = ""
-    try:
-        arch = execute_with_uid(url, db, uid, pw, model, "get_views", [], {"views": [[v_id, "form"]]}, timeout=45).get("views", {}).get("form", {}).get("arch", "")
-    except Exception:
+
+    def get_fields():
+        return execute_with_uid(url, db, uid, pw, model, "fields_get", [], {"attributes": ["string", "type", "relation", "selection", "required"]}, timeout=45)
+
+    def get_arch():
         try:
-            arch = execute_with_uid(url, db, uid, pw, model, "fields_view_get", [], {"view_id": v_id, "view_type": "form"}, timeout=45).get("arch", "")
+            return execute_with_uid(url, db, uid, pw, model, "get_views", [], {"views": [[v_id, "form"]]}, timeout=45).get("views", {}).get("form", {}).get("arch", "")
         except Exception:
-            pass
+            try:
+                return execute_with_uid(url, db, uid, pw, model, "fields_view_get", [], {"view_id": v_id, "view_type": "form"}, timeout=45).get("arch", "")
+            except Exception:
+                return ""
+
+    # Run fields_get and get_views simultaneously in parallel
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_future = pool.submit(get_fields)
+        a_future = pool.submit(get_arch)
+        f_info = f_future.result()
+        arch = a_future.result()
 
     btns, visible_names = [], []
     if arch:
@@ -157,7 +197,7 @@ def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
         req_tag = " [REQUIRED]" if req else ""
 
         if ftype == "selection" and meta.get("selection"):
-            opts = ", ".join(f"`{x}` ({x})" for x in meta["selection"] if isinstance(x, (list, tuple)) and len(x) >= 2)
+            opts = ", ".join(f"`{x[0]}` ({x[1]})" for x in meta["selection"] if isinstance(x, (list, tuple)) and len(x) >= 2)
             field_summary.append(f"- `{fname}` ({ftype}{req_tag}): {label} -> Options: {opts}")
         else:
             field_summary.append(f"- `{fname}` ({ftype}{req_tag}): {label}")
@@ -177,9 +217,9 @@ def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
                 default_vals[fname] = f"{raw_d} 00:00:00" if ftype == "datetime" else raw_d
 
         elif ftype == "selection" and meta.get("selection") and fname not in default_vals:
-            valid = [item for item in meta["selection"] if isinstance(item, (list, tuple)) and len(item) >= 2]
+            valid = [item[0] for item in meta["selection"] if isinstance(item, (list, tuple)) and len(item) >= 2]
             if valid:
-                default_vals[fname] = valid
+                default_vals[fname] = valid[0]
 
         elif ftype in ("many2one", "many2many") and meta.get("relation"):
             rel_model = meta["relation"]
@@ -192,7 +232,7 @@ def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
                 if opts:
                     default_vals[fname] = next(iter(opts.values()))
 
-    return {
+    prof = {
         "valid_fields": valid_fields,
         "field_types": field_types,
         "start_fields": start_fields,
@@ -202,8 +242,11 @@ def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
         "summary": field_summary,
         "rel_fields": rel_fields,
     }
+    PROFILE_CACHE[cache_key] = prof
+    save_disk_cache(PROFILE_CACHE)
+    return prof
 
-print("✅ Cell 2A-1 loaded cleanly!")
+print("✅ Cell 2A-1 loaded with parallel inspection & disk cache!")
 
 def connect_and_discover(url, db, user, pw, progress=gr.Progress()):
     try:
@@ -289,8 +332,11 @@ def inspect_wizard(url, db, user, pw, selected_label, wiz_map, cur_from, cur_to)
         f1_key = pick_priority(rel_keys, ["categ", "category", "account_ids", "account"])
         f2_key = pick_priority(rel_keys, ["product", "location", "journal", "partner"], exclude=f1_key)
 
-        f1_opts = sorted(list(fetch_rel_options(url, db, uid, pw, rel_fields[f1_key], w["name"]).keys())) if f1_key else []
-        f2_opts = sorted(list(fetch_rel_options(url, db, uid, pw, rel_fields[f2_key], w["name"]).keys())) if f2_key else []
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fut1 = pool.submit(fetch_rel_options, url, db, uid, pw, rel_fields[f1_key], w["name"]) if f1_key else None
+            fut2 = pool.submit(fetch_rel_options, url, db, uid, pw, rel_fields[f2_key], w["name"]) if f2_key else None
+            f1_opts = sorted(list(fut1.result().keys())) if fut1 else []
+            f2_opts = sorted(list(fut2.result().keys())) if fut2 else []
 
         info_md = (
             f"### Wizard: **{w['name']}** (`{w['res_model']}`)\n"
@@ -356,7 +402,7 @@ def sync_ui_to_json(params_json, d_from, d_to, is_as_on, f1_label, f1_vals, f2_l
                 if fvals:
                     ids = [opt_map[v] for v in fvals if v in opt_map]
                     if ids:
-                        data[fname] = [[6, 0, ids]] if ftype == "many2many" else ids
+                        data[fname] = [[6, 0, ids]] if ftype == "many2many" else ids[0]
                 elif fname in data:
                     data[fname] = [[6, 0, []]] if ftype == "many2many" else False
 
@@ -576,18 +622,73 @@ def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, 
 
 print("✅ Cell 3 loaded successfully!")
 
-import threading, re, io, json, tempfile, os, base64, openpyxl, xlsxwriter
-from datetime import datetime
+import threading, re, io, json, tempfile, os, base64, openpyxl, xlsxwriter, requests, time
+from datetime import datetime, timedelta
 import gradio as gr
 
 STOP_EVENT = threading.Event()
+OPENER_CACHE = {}
+CTX_CACHE = {}
 
 def stop_generation():
     STOP_EVENT.set()
     return "🛑 Stop signal sent!"
 
+def get_cached_web_session(url, db, user, pw):
+    key = (url.strip().rstrip("/"), db.strip(), user.strip(), pw)
+    if key not in OPENER_CACHE:
+        clean_url = key[0]
+        sess = requests.Session()
+        sess.headers.update({"User-Agent": "Mozilla/5.0"})
+        auth_payload = {"jsonrpc": "2.0", "params": {"db": db, "login": user, "password": pw}}
+        resp = sess.post(f"{clean_url}/web/session/authenticate", json=auth_payload, timeout=30)
+        resp.raise_for_status()
+        auth_res = resp.json()
+        if "error" in auth_res or not auth_res.get("result", {}).get("uid"):
+            raise Exception("Web session authentication failed.")
+        OPENER_CACHE[key] = (sess, clean_url)
+    return OPENER_CACHE[key]
+
+def get_cached_context(url, db, uid, pw):
+    key = (url.strip().rstrip("/"), db.strip(), uid)
+    if key not in CTX_CACHE:
+        CTX_CACHE[key] = execute_with_uid(url, db, uid, pw, "res.users", "context_get", [], timeout=45) or {}
+    return CTX_CACHE[key]
+
+def split_date_chunks(d_from_str, d_to_str, chunk_days=60):
+    try:
+        dt1 = datetime.strptime(str(d_from_str)[:10], "%Y-%m-%d")
+        dt2 = datetime.strptime(str(d_to_str)[:10], "%Y-%m-%d")
+        if (dt2 - dt1).days <= 90:
+            return [(str(d_from_str)[:10], str(d_to_str)[:10])]
+        chunks = []
+        cur = dt1
+        while cur <= dt2:
+            nxt = min(cur + timedelta(days=chunk_days - 1), dt2)
+            chunks.append((cur.strftime("%Y-%m-%d"), nxt.strftime("%Y-%m-%d")))
+            cur = nxt + timedelta(days=1)
+        return chunks
+    except Exception:
+        return [(d_from_str, d_to_str)]
+
+def merge_xlsx_chunks(byte_list):
+    wb_out = openpyxl.Workbook(write_only=True)
+    ws_out = wb_out.create_sheet(title="Merged_Report")
+    header_written = False
+    for b in byte_list:
+        wb_in = openpyxl.load_workbook(io.BytesIO(b), read_only=True, data_only=True)
+        ws_in = wb_in[wb_in.sheetnames[0]]
+        for idx, row in enumerate(ws_in.iter_rows(values_only=True)):
+            if idx == 0 and header_written:
+                continue
+            ws_out.append(list(row))
+        header_written = True
+        wb_in.close()
+    out_buf = io.BytesIO()
+    wb_out.save(out_buf)
+    return out_buf.getvalue()
+
 def optimize_large_xlsx(file_bytes, fname_out, threshold_mb=15.0):
-    """Strips heavy Odoo XML styles only from massive >15MB .xlsx files."""
     if not fname_out.lower().endswith(".xlsx") or len(file_bytes) < threshold_mb * 1024 * 1024:
         return file_bytes, fname_out
     try:
@@ -609,37 +710,97 @@ def optimize_large_xlsx(file_bytes, fname_out, threshold_mb=15.0):
     return file_bytes, fname_out
 
 def run_wizard_and_download(url, db, user, pw, selected_label, wiz_map, params_json, btn_method, progress=gr.Progress()):
+    STOP_EVENT.clear()
+    t0 = time.time()
     try:
         if not selected_label or selected_label not in wiz_map:
             raise Exception("Please select a valid wizard report first.")
-        progress(0.10, desc="Authenticating with Odoo...")
+        progress(0.08, desc="Connecting with cached session...")
         uid = get_cached_uid(url, db, user, pw)
-        opener, clean_base = get_auth_opener(url, db, user, pw)
-        progress(0.30, desc="Loading wizard context & parameters...")
+        web_sess, clean_base = get_cached_web_session(url, db, user, pw)
+        user_ctx = get_cached_context(url, db, uid, pw)
+
+        class FastOpener:
+            def open(self, target_url, timeout=900):
+                r = web_sess.get(target_url, timeout=timeout)
+                r.raise_for_status()
+                return io.BytesIO(r.content)
+
         w = wiz_map[selected_label]
         wiz_vals = json.loads(params_json) if params_json.strip() else {}
-        user_ctx = execute_with_uid(url, db, uid, pw, "res.users", "context_get", [], timeout=45) or {}
-        progress(0.55, desc=f"Executing '{w['name']}' on Odoo server (please wait)...")
-        file_bytes, fname_out, used_method = fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, btn_method, user_ctx, timeout=900)
+        prof = w.get("profile", {})
+        start_f = prof.get("start_fields", [])
+        end_f = prof.get("end_fields", [])
+
+        # Check if we should auto-chunk a wide date range (>90 days) to prevent 502 timeouts
+        chunks = None
+        if start_f and end_f and not wiz_vals.get("is_as_on") and w.get("action_type") == "window":
+            s_name, s_type = start_f[0]
+            e_name, e_type = end_f[0]
+            if wiz_vals.get(s_name) and wiz_vals.get(e_name):
+                date_pairs = split_date_chunks(wiz_vals[s_name], wiz_vals[e_name], chunk_days=60)
+                if len(date_pairs) > 1:
+                    chunks = (s_name, s_type, e_name, e_type, date_pairs)
+
+        if chunks:
+            s_name, s_type, e_name, e_type, date_pairs = chunks
+            chunk_bytes_list = []
+            fname_out = f"{w['name'].replace(' ', '_')}.xlsx"
+            for i, (c_from, c_to) in enumerate(date_pairs):
+                if STOP_EVENT.is_set():
+                    raise Exception("Cancelled by user.")
+                frac = 0.15 + 0.70 * (i / len(date_pairs))
+                progress(frac, desc=f"Fetching batch {i+1}/{len(date_pairs)} ({c_from} to {c_to})...")
+                sub_vals = dict(wiz_vals)
+                sub_vals[s_name] = f"{c_from} 00:00:00" if s_type == "datetime" else c_from
+                sub_vals[e_name] = f"{c_to} 23:59:59" if e_type == "datetime" else c_to
+                b_out, f_out, _ = fetch_single_wizard_fast(
+                    url, db, uid, pw, FastOpener(), clean_base, w, sub_vals, btn_method, user_ctx, timeout=900
+                )
+                if b_out:
+                    if not f_out.lower().endswith(".xlsx"):
+                        # Non-Excel (PDF/HTML) cannot be row-merged; fall back to single full call
+                        chunk_bytes_list = []
+                        break
+                    chunk_bytes_list.append(b_out)
+                    fname_out = f_out
+
+            if chunk_bytes_list:
+                progress(0.90, desc=f"Merging {len(chunk_bytes_list)} batches into one Excel file...")
+                file_bytes = merge_xlsx_chunks(chunk_bytes_list)
+            else:
+                progress(0.45, desc=f"Executing '{w['name']}' on Odoo server...")
+                file_bytes, fname_out, _ = fetch_single_wizard_fast(
+                    url, db, uid, pw, FastOpener(), clean_base, w, wiz_vals, btn_method, user_ctx, timeout=900
+                )
+        else:
+            progress(0.40, desc=f"Waiting for Odoo server to build '{w['name']}'...")
+            file_bytes, fname_out, _ = fetch_single_wizard_fast(
+                url, db, uid, pw, FastOpener(), clean_base, w, wiz_vals, btn_method, user_ctx, timeout=900
+            )
+
         if not file_bytes:
             raise Exception("Odoo returned an empty file. Check the wizard parameters or required fields.")
 
         raw_mb = len(file_bytes) / (1024 * 1024)
-        progress(0.85, desc=f"Preparing {raw_mb:.1f} MB report file...")
+        progress(0.95, desc=f"Saving {raw_mb:.1f} MB report file...")
         file_bytes, fname_out = optimize_large_xlsx(file_bytes, fname_out, threshold_mb=15.0)
         final_mb = len(file_bytes) / (1024 * 1024)
 
         out_path = os.path.join(tempfile.gettempdir(), fname_out)
         with open(out_path, "wb") as f:
             f.write(file_bytes)
+        elapsed = time.time() - t0
         progress(1.0, desc="Done!")
         size_note = f"{raw_mb:.1f} MB → {final_mb:.1f} MB" if raw_mb > final_mb + 0.5 else f"{final_mb:.1f} MB"
-        return f"✅ Successfully generated **{fname_out}** ({size_note}, all rows & columns preserved)!", out_path
+        return f"✅ Generated **{fname_out}** ({size_note}) in **{elapsed:.1f}s**!", out_path
     except Exception as e:
         return f"❌ Generation failed: {str(e)}", None
 
 def disconnect_session():
     UID_CACHE.clear()
+    OPENER_CACHE.clear()
+    CTX_CACHE.clear()
     return (
         "",
         "ℹ Session cleared successfully.",
@@ -656,7 +817,39 @@ def disconnect_session():
         None,
     )
 
-# Paste your existing custom_css string right below here
+custom_css = """
+html, body, .gradio-container, .gradio-container-3-50, #component-0 {
+    background-color: #0b0f19 !important;
+    background-image:
+        linear-gradient(180deg, rgba(11, 15, 25, 0.55) 0%, rgba(11, 15, 25, 0.85) 100%),
+        url('/file=accounting-vs-finance-differences-ohsc.webp') !important;
+    background-size: cover !important;
+    background-position: center !important;
+    color: #f8fafc !important;
+}
+.gradio-container * { font-family: 'Segoe UI', -apple-system, sans-serif !important; }
+.gradio-container .wrap.default, .gradio-container .progress-bar-wrap, .gradio-container .toast-wrap {
+    background: rgba(15, 18, 28, 0.94) !important;
+    border: 1px solid rgba(251, 191, 36, 0.5) !important;
+    border-radius: 8px !important;
+    color: #ffffff !important;
+    z-index: 9999 !important;
+}
+.gradio-container .progress-level {
+    background: rgba(30, 41, 59, 0.85) !important;
+    border-radius: 6px !important;
+    overflow: hidden !important;
+    height: 10px !important;
+    border: 1px solid rgba(251, 191, 36, 0.3) !important;
+}
+.gradio-container .progress-level-inner, .gradio-container .progress-bar, .gradio-container progress::-webkit-progress-value {
+    background: linear-gradient(90deg, #d97706 0%, #f59e0b 50%, #fde047 100%) !important;
+    background-color: #f59e0b !important;
+    height: 100% !important;
+}
+"""
+
+print("✅ Cell 5 loaded with auto-chunking, session caching & custom_css!")
 
 with gr.Blocks(title="MGR DOGRA - ENTERPRISE COCKPIT") as demo:
     gr.HTML(
