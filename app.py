@@ -840,90 +840,6 @@ def disconnect_session():
 print("✅ Cell 5A-Part 3 loaded cleanly!")
 
 
-with gr.Blocks(title="MGR DOGRA - ENTERPRISE COCKPIT") as demo:
-    gr.HTML(
-        """
-        <div class='glow-banner'>
-            <div style='display: flex; justify-content: center; align-items: center; gap: 15px;'>
-                <span class='gear-icon'>⚙</span>
-                <span class='glow-logo'>MGR DOGRA</span>
-                <span class='gear-icon'>⚙</span>
-            </div>
-            <p>ENTERPRISE COCKPIT • ACCOUNTING LEDGER HUBS</p>
-            <div class='mechanical-roller'></div>
-        </div>
-        """
-    )
-
-    wiz_state, acc_state = gr.State({}), gr.State({})
-
-    with gr.Accordion("Odoo Connection Setup", open=True) as conn_section:
-        with gr.Row():
-            in_url = gr.Textbox(label="Odoo ERP URL", value="https://erp.lakecement.co.tz/", placeholder="https://...")
-            in_db = gr.Textbox(label="Database Name", value="parallel")
-            in_user = gr.Textbox(label="Username / Email", placeholder="name@company.com")
-            in_pass = gr.Textbox(label="Password", type="password")
-        with gr.Row():
-            btn_connect = gr.Button("Connect & Discover", variant="primary")
-            btn_disconnect = gr.Button("Disconnect Session", variant="secondary")
-
-    with gr.Group():
-        status_box = gr.Markdown("ℹ *System offline. Fill in your credentials and click Connect.*")
-
-    with gr.Row():
-        with gr.Column(scale=5, variant="panel"):
-            gr.Markdown("### Sidebar controls & Configuration")
-            wiz_dropdown = gr.Dropdown(label="Select Wizard Report", choices=list())
-            btn_load = gr.Button("Fetch Wizard Profiles", variant="secondary")
-
-            with gr.Row():
-                in_from_date = gr.Textbox(label="From Date", placeholder="DD-MM-YYYY (e.g. 01-04-2024)")
-                in_to_date = gr.Textbox(label="To Date", placeholder="DD-MM-YYYY (e.g. 31-10-2026)")
-
-            in_as_on = gr.Checkbox(label="Print 'As On' Date (Historical)", value=False)
-            in_f1_field = gr.Dropdown(label="Primary Filter Field (e.g. Category / Account)", choices=list())
-            in_f1_vals = gr.Dropdown(label="Primary Filter Values", choices=list(), multiselect=True)
-            in_f2_field = gr.Dropdown(label="Secondary Filter Field (e.g. Product / Partner)", choices=list())
-            in_f2_vals = gr.Dropdown(label="Secondary Filter Values", choices=list(), multiselect=True)
-
-        with gr.Column(scale=6, variant="panel"):
-            gr.Markdown("### Active execution console")
-            wiz_details = gr.Markdown("*Choose a report from the sidebar menu to populate details here.*")
-            params_editor = gr.Code(label="Auto-Generated Wizard Payload (JSON)", language="json", value="{}", interactive=True)
-            btn_method_in = gr.Textbox(label="Odoo Execution Method", value="action_print_report")
-
-            gr.Markdown("### Action controllers")
-            with gr.Row():
-                btn_generate = gr.Button("ᄑ Execute & Extract Ledger", variant="primary")
-                btn_stop = gr.Button("⏹ Cancel Request", variant="stop")
-
-            gen_status = gr.Markdown("**Ready for instructions...**")
-            download_file = gr.File(label="⌇ Download Output Ledger File Here", interactive=False)
-
-    btn_connect.click(connect_and_discover, [in_url, in_db, in_user, in_pass], [status_box, wiz_dropdown, wiz_state])
-    btn_disconnect.click(disconnect_session, list(), [in_pass, status_box, wiz_dropdown, wiz_state, wiz_details, params_editor, in_f1_field, in_f1_vals, in_f2_field, in_f2_vals, acc_state, gen_status, download_file])
-
-    wiz_outputs = [wiz_details, params_editor, btn_method_in, in_as_on, in_f1_field, in_f1_vals, in_f2_field, in_f2_vals, acc_state]
-    wiz_dropdown.change(inspect_wizard, [in_url, in_db, in_user, in_pass, wiz_dropdown, wiz_state, in_from_date, in_to_date], wiz_outputs)
-    btn_load.click(inspect_wizard, [in_url, in_db, in_user, in_pass, wiz_dropdown, wiz_state, in_from_date, in_to_date], wiz_outputs)
-
-    in_f1_field.change(on_rel_field_change, [in_url, in_db, in_user, in_pass, in_f1_field, acc_state], [in_f1_vals, acc_state])
-    in_f2_field.change(on_rel_field_change, [in_url, in_db, in_user, in_pass, in_f2_field, acc_state], [in_f2_vals, acc_state])
-
-    sync_inputs = [params_editor, in_from_date, in_to_date, in_as_on, in_f1_field, in_f1_vals, in_f2_field, in_f2_vals, acc_state, wiz_dropdown, wiz_state]
-    for ctrl in [in_from_date, in_to_date, in_as_on, in_f1_vals, in_f2_vals]:
-        ctrl.change(sync_ui_to_json, sync_inputs, [params_editor])
-
-    gen_event = btn_generate.click(run_wizard_and_download, [in_url, in_db, in_user, in_pass, wiz_dropdown, wiz_state, params_editor, btn_method_in], [gen_status, download_file])
-    btn_stop.click(stop_generation, list(), [gen_status], cancels=[gen_event])
-
-import os, subprocess
-os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
-
-subprocess.run(["pkill", "-f", "frpc"], check=False)
-gr.close_all()
-
-
 # ADDITIVE MODULE: Fast TB-Exact Single Reports (GRIR, Purchase Register, Sales Register, Kardex / Inventory)
 # Wraps existing connect_and_discover and fetch_single_wizard_fast without modifying any existing cells.
 
@@ -1112,6 +1028,92 @@ def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, 
     return _orig_fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, btn_method, user_ctx, timeout=timeout)
 
 print("✅ Fast TB-Exact Single Reports (GRIR, Purchase, Sales, Kardex) attached cleanly!")
+
+with gr.Blocks(title="MGR DOGRA - ENTERPRISE COCKPIT") as demo:
+    gr.HTML(
+        """
+        <div class='glow-banner'>
+            <div style='display: flex; justify-content: center; align-items: center; gap: 15px;'>
+                <span class='gear-icon'>⚙</span>
+                <span class='glow-logo'>MGR DOGRA</span>
+                <span class='gear-icon'>⚙</span>
+            </div>
+            <p>ENTERPRISE COCKPIT • ACCOUNTING LEDGER HUBS</p>
+            <div class='mechanical-roller'></div>
+        </div>
+        """
+    )
+
+    wiz_state, acc_state = gr.State({}), gr.State({})
+
+    with gr.Accordion("Odoo Connection Setup", open=True) as conn_section:
+        with gr.Row():
+            in_url = gr.Textbox(label="Odoo ERP URL", value="https://erp.lakecement.co.tz/", placeholder="https://...")
+            in_db = gr.Textbox(label="Database Name", value="parallel")
+            in_user = gr.Textbox(label="Username / Email", placeholder="name@company.com")
+            in_pass = gr.Textbox(label="Password", type="password")
+        with gr.Row():
+            btn_connect = gr.Button("Connect & Discover", variant="primary")
+            btn_disconnect = gr.Button("Disconnect Session", variant="secondary")
+
+    with gr.Group():
+        status_box = gr.Markdown("ℹ *System offline. Fill in your credentials and click Connect.*")
+
+    with gr.Row():
+        with gr.Column(scale=5, variant="panel"):
+            gr.Markdown("### Sidebar controls & Configuration")
+            wiz_dropdown = gr.Dropdown(label="Select Wizard Report", choices=list())
+            btn_load = gr.Button("Fetch Wizard Profiles", variant="secondary")
+
+            with gr.Row():
+                in_from_date = gr.Textbox(label="From Date", placeholder="DD-MM-YYYY (e.g. 01-04-2024)")
+                in_to_date = gr.Textbox(label="To Date", placeholder="DD-MM-YYYY (e.g. 31-10-2026)")
+
+            in_as_on = gr.Checkbox(label="Print 'As On' Date (Historical)", value=False)
+            in_f1_field = gr.Dropdown(label="Primary Filter Field (e.g. Category / Account)", choices=list())
+            in_f1_vals = gr.Dropdown(label="Primary Filter Values", choices=list(), multiselect=True)
+            in_f2_field = gr.Dropdown(label="Secondary Filter Field (e.g. Product / Partner)", choices=list())
+            in_f2_vals = gr.Dropdown(label="Secondary Filter Values", choices=list(), multiselect=True)
+
+        with gr.Column(scale=6, variant="panel"):
+            gr.Markdown("### Active execution console")
+            wiz_details = gr.Markdown("*Choose a report from the sidebar menu to populate details here.*")
+            params_editor = gr.Code(label="Auto-Generated Wizard Payload (JSON)", language="json", value="{}", interactive=True)
+            btn_method_in = gr.Textbox(label="Odoo Execution Method", value="action_print_report")
+
+            gr.Markdown("### Action controllers")
+            with gr.Row():
+                btn_generate = gr.Button("ᄑ Execute & Extract Ledger", variant="primary")
+                btn_stop = gr.Button("⏹ Cancel Request", variant="stop")
+
+            gen_status = gr.Markdown("**Ready for instructions...**")
+            download_file = gr.File(label="⌇ Download Output Ledger File Here", interactive=False)
+
+    btn_connect.click(connect_and_discover, [in_url, in_db, in_user, in_pass], [status_box, wiz_dropdown, wiz_state])
+    btn_disconnect.click(disconnect_session, list(), [in_pass, status_box, wiz_dropdown, wiz_state, wiz_details, params_editor, in_f1_field, in_f1_vals, in_f2_field, in_f2_vals, acc_state, gen_status, download_file])
+
+    wiz_outputs = [wiz_details, params_editor, btn_method_in, in_as_on, in_f1_field, in_f1_vals, in_f2_field, in_f2_vals, acc_state]
+    wiz_dropdown.change(inspect_wizard, [in_url, in_db, in_user, in_pass, wiz_dropdown, wiz_state, in_from_date, in_to_date], wiz_outputs)
+    btn_load.click(inspect_wizard, [in_url, in_db, in_user, in_pass, wiz_dropdown, wiz_state, in_from_date, in_to_date], wiz_outputs)
+
+    in_f1_field.change(on_rel_field_change, [in_url, in_db, in_user, in_pass, in_f1_field, acc_state], [in_f1_vals, acc_state])
+    in_f2_field.change(on_rel_field_change, [in_url, in_db, in_user, in_pass, in_f2_field, acc_state], [in_f2_vals, acc_state])
+
+    sync_inputs = [params_editor, in_from_date, in_to_date, in_as_on, in_f1_field, in_f1_vals, in_f2_field, in_f2_vals, acc_state, wiz_dropdown, wiz_state]
+    for ctrl in [in_from_date, in_to_date, in_as_on, in_f1_vals, in_f2_vals]:
+        ctrl.change(sync_ui_to_json, sync_inputs, [params_editor])
+
+    gen_event = btn_generate.click(run_wizard_and_download, [in_url, in_db, in_user, in_pass, wiz_dropdown, wiz_state, params_editor, btn_method_in], [gen_status, download_file])
+    btn_stop.click(stop_generation, list(), [gen_status], cancels=[gen_event])
+
+import os, subprocess
+os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
+
+subprocess.run(["pkill", "-f", "frpc"], check=False)
+gr.close_all()
+
+
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
