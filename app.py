@@ -58,6 +58,11 @@ print("✅ Part 1 loaded with connection pooling & retry!")
 
 from datetime import datetime, timedelta
 import urllib.parse
+import os
+import json
+import tempfile
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 
 UID_CACHE = {}
 CACHE_FILE = os.path.join(tempfile.gettempdir(), "odoo_wizard_cache.json")
@@ -83,13 +88,13 @@ PROFILE_CACHE = load_disk_cache()
 def get_cached_uid(url, db, user, pw):
     key = (url.strip().rstrip("/"), db.strip(), user.strip(), pw)
     if key not in UID_CACHE:
-        uid = odoo_jsonrpc(url, "common", "authenticate", [db, user, pw, {}], timeout=45)
+        uid = odoo_jsonrpc(url, "common", "authenticate", [db, user, pw, {}], timeout=60)
         if not uid:
             raise Exception("Authentication failed.")
         UID_CACHE[key] = uid
     return UID_CACHE[key]
 
-def execute_with_uid(url, db, uid, pw, model, method, args, kwargs=None, timeout=900):
+def execute_with_uid(url, db, uid, pw, model, method, args, kwargs=None, timeout=3600):
     call_args = [db, uid, pw, model, method, args]
     if kwargs is not None:
         call_args.append(kwargs)
@@ -103,7 +108,6 @@ def to_odoo_date(date_str):
         return ""
     if s.lstrip("-").isdigit():
         if len(s) == 8:
-            # Auto-format DDMMYYYY (e.g. '01042026' -> '01-04-2026')
             s = f"{s[0:2]}-{s[2:4]}-{s[4:8]}"
         else:
             return (datetime.today() + timedelta(days=int(s))).strftime("%Y-%m-%d")
@@ -120,9 +124,9 @@ def fetch_rel_options(url, db, uid, pw, rel_meta, wiz_name=""):
     rel_model = rel_meta["relation"]
     search_arg = "GRIR" if (rel_model == "account.account" and "grir" in wiz_name.lower()) else ""
     try:
-        pairs = execute_with_uid(url, db, uid, pw, rel_model, "name_search", [], {"name": search_arg, "limit": 150}, timeout=20)
+        pairs = execute_with_uid(url, db, uid, pw, rel_model, "name_search", [], {"name": search_arg, "limit": 100000}, timeout=120)
         if not pairs and search_arg:
-            pairs = execute_with_uid(url, db, uid, pw, rel_model, "name_search", [], {"name": "", "limit": 150}, timeout=20)
+            pairs = execute_with_uid(url, db, uid, pw, rel_model, "name_search", [], {"name": "", "limit": 100000}, timeout=120)
         opt_map = {f"{p[1]} (ID:{p[0]})": p[0] for p in (pairs or []) if isinstance(p, (list, tuple)) and len(p) >= 2}
         rel_meta["options"] = opt_map
         rel_meta["loaded"] = True
@@ -154,18 +158,17 @@ def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
     v_id = next(iter(v_raw), False) if isinstance(v_raw, list) else False
 
     def get_fields():
-        return execute_with_uid(url, db, uid, pw, model, "fields_get", [], {"attributes": ["string", "type", "relation", "selection", "required"]}, timeout=45)
+        return execute_with_uid(url, db, uid, pw, model, "fields_get", [], {"attributes": ["string", "type", "relation", "selection", "required"]}, timeout=120)
 
     def get_arch():
         try:
-            return execute_with_uid(url, db, uid, pw, model, "get_views", [], {"views": [[v_id, "form"]]}, timeout=45).get("views", {}).get("form", {}).get("arch", "")
+            return execute_with_uid(url, db, uid, pw, model, "get_views", [], {"views": [[v_id, "form"]]}, timeout=120).get("views", {}).get("form", {}).get("arch", "")
         except Exception:
             try:
-                return execute_with_uid(url, db, uid, pw, model, "fields_view_get", [], {"view_id": v_id, "view_type": "form"}, timeout=45).get("arch", "")
+                return execute_with_uid(url, db, uid, pw, model, "fields_view_get", [], {"view_id": v_id, "view_type": "form"}, timeout=120).get("arch", "")
             except Exception:
                 return ""
 
-    # Run fields_get and get_views simultaneously in parallel
     with ThreadPoolExecutor(max_workers=2) as pool:
         f_future = pool.submit(get_fields)
         a_future = pool.submit(get_arch)
@@ -186,7 +189,7 @@ def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
 
     valid_fields = visible_names if visible_names else [k for k in f_info if k not in ignore and not k.startswith("message_") and f_info[k].get("type") != "binary"]
     try:
-        default_vals = execute_with_uid(url, db, uid, pw, model, "default_get", [valid_fields], timeout=45) or {}
+        default_vals = execute_with_uid(url, db, uid, pw, model, "default_get", [valid_fields], timeout=120) or {}
     except Exception:
         default_vals = {}
 
@@ -250,7 +253,7 @@ def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
     save_disk_cache(PROFILE_CACHE)
     return prof
 
-print("✅ Cell 2A-1 loaded with auto 8-digit date format parser!")
+print("✅ Cell 310fTof7mloq fully restored and configured with 100k limits!")
 
 def connect_and_discover(url, db, user, pw, progress=gr.Progress()):
     try:
