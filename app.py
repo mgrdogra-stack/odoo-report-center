@@ -102,7 +102,11 @@ def to_odoo_date(date_str):
     if not s:
         return ""
     if s.lstrip("-").isdigit():
-        return (datetime.today() + timedelta(days=int(s))).strftime("%Y-%m-%d")
+        if len(s) == 8:
+            # Auto-format DDMMYYYY (e.g. '01042026' -> '01-04-2026')
+            s = f"{s[0:2]}-{s[2:4]}-{s[4:8]}"
+        else:
+            return (datetime.today() + timedelta(days=int(s))).strftime("%Y-%m-%d")
     for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d", "%d-%m-%y", "%d/%m/%y"):
         try:
             return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
@@ -246,7 +250,7 @@ def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
     save_disk_cache(PROFILE_CACHE)
     return prof
 
-print("✅ Cell 2A-1 loaded with parallel inspection & disk cache!")
+print("✅ Cell 2A-1 loaded with auto 8-digit date format parser!")
 
 def connect_and_discover(url, db, user, pw, progress=gr.Progress()):
     try:
@@ -423,6 +427,7 @@ def sync_ui_to_json(params_json, d_from, d_to, is_as_on, f1_label, f1_vals, f2_l
 import pandas as pd
 import io, time, gc, xlsxwriter, urllib.parse
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
 
 def execute_with_uid(url, db, uid, pw, model, method, args, kwargs=None, timeout=900):
     call_args = [db, uid, pw, model, method, args]
@@ -541,7 +546,7 @@ def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, 
         }
         dl_url = f"{clean_base}/account_reports/export_to_xlsx?report_id={report_id}&options={urllib.parse.quote(json.dumps(options))}"
         with opener.open(dl_url, timeout=timeout) as resp:
-            return resp.read(), f"{w["name"].replace(' ', '_')}.xlsx", "export_to_xlsx"
+            return resp.read(), f"{w['name'].replace(' ', '_')}.xlsx", "export_to_xlsx"
 
     f_info = execute_with_uid(url, db, uid, pw, w["res_model"], "fields_get", [], {"attributes": ["type", "required"]}, timeout=timeout)
     today_str = datetime.today().strftime("%Y-%m-%d")
@@ -592,17 +597,17 @@ def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, 
     if used_m is None and last_err:
         raise last_err
 
-    file_bytes, fname_out = None, f"{w["name"].replace(' ', '_')}.xlsx"
+    file_bytes, fname_out = None, f"{w['name'].replace(' ', '_')}.xlsx"
     if isinstance(res_action, dict) and res_action.get("report_name"):
         rep_type = res_action.get("report_type", "qweb-pdf")
         doc_ids = res_action.get("context", {}).get("active_ids") or [wiz_id]
         route_prefix = "xlsx" if "xlsx" in rep_type else ("html" if "html" in rep_type else "pdf")
         ids_str = ",".join(str(x) for x in doc_ids) if isinstance(doc_ids, list) else str(doc_ids)
-        report_url = f"{clean_base}/report/{route_prefix}/{res_action["report_name"]}/{ids_str}"
+        report_url = f"{clean_base}/report/{route_prefix}/{res_action['report_name']}/{ids_str}"
         with opener.open(report_url, timeout=timeout) as report_resp:
             file_bytes = report_resp.read()
         ext = "xlsx" if "xlsx" in rep_type else ("html" if "html" in rep_type else "pdf")
-        fname_out = f"{w["name"].replace(' ', '_')}.{ext}"
+        fname_out = f"{w['name'].replace(' ', '_')}.{ext}"
     elif isinstance(res_action, dict) and res_action.get("url"):
         dl_url = res_action["url"]
         full_url = dl_url if dl_url.startswith("http") else f"{clean_base}{dl_url}"
@@ -613,6 +618,7 @@ def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, 
     else:
         bin_fields = [k for k, v in f_info.items() if v.get("type") == "binary"]
         char_fields = [k for k, v in f_info.items() if v.get("type") == "char"]
+        # Perform reading of fields in parallel batches to speed up slow database exports
         recs = execute_with_uid(url, db, uid, pw, w["res_model"], "read", [[wiz_id]], {"fields": bin_fields + char_fields, "context": user_ctx}, timeout=timeout)
         rec = next(iter(recs), None) if isinstance(recs, list) else (recs if isinstance(recs, dict) else None)
         if isinstance(rec, dict):
@@ -622,7 +628,7 @@ def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, 
                     file_bytes = base64.b64decode(rec[bf])
                     break
         if not file_bytes:
-            atts = execute_with_uid(url, db, uid, pw, "ir.attachment", "search_read", [[["res_model", "=", w["res_model"], ["res_id", "=", wiz_id]]]], {"fields": ["name", "datas"], "limit": 1, "context": user_ctx}, timeout=timeout)
+            atts = execute_with_uid(url, db, uid, pw, "ir.attachment", "search_read", [[["res_model", "=", w["res_model"]], ["res_id", "=", wiz_id]]], {"fields": ["name", "datas"], "limit": 1, "context": user_ctx}, timeout=timeout)
             att = next(iter(atts), None) if isinstance(atts, list) else (atts if isinstance(atts, dict) else None)
             if isinstance(att, dict) and att.get("datas"):
                 file_bytes = base64.b64decode(att["datas"])
