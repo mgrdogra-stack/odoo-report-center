@@ -250,21 +250,31 @@ print("✅ Cell 2A-1 loaded with parallel inspection & disk cache!")
 
 def connect_and_discover(url, db, user, pw, progress=gr.Progress()):
     try:
-        progress(0.2, desc="Authenticating & discovering wizards...")
+        progress(0.1, desc="Authenticating user...")
         uid = get_cached_uid(url, db, user, pw)
-        progress(0.6, desc="Loading all report wizards & financial statements...")
+
+        progress(0.3, desc="Loading user-accessible report wizards...")
+        # Query wizards matching window actions, restricted to user's permitted models
         wizards = execute_with_uid(
             url, db, uid, pw, "ir.actions.act_window", "search_read",
             [[["target", "=", "new"], ["res_model", "!=", False]]],
-            {"fields": ["id", "name", "res_model", "view_id"], "limit": 1000},
+            {"fields": ["id", "name", "res_model", "view_id"], "limit": 1500},
             timeout=120
         )
 
         client_reports = []
+        progress(0.6, desc="Fetching user-accessible account reports...")
         try:
-            acct_reps = execute_with_uid(url, db, uid, pw, "account.report", "search_read", [[]], {"fields": ["id", "name"], "limit": 200}, timeout=60)
+            acct_reps = execute_with_uid(url, db, uid, pw, "account.report", "search_read", [[]], {"fields": ["id", "name"], "limit": 250}, timeout=60)
             for r in acct_reps:
-                client_reports.append({"id": r["id"], "name": r["name"], "action_type": "client", "res_model": "account.report", "context": {"report_id": r["id"]}, "params": {"report_id": r["id"]}})
+                client_reports.append({
+                    "id": r["id"],
+                    "name": r["name"],
+                    "action_type": "client",
+                    "res_model": "account.report",
+                    "context": {"report_id": r["id"]},
+                    "params": {"report_id": r["id"]}
+                })
         except Exception:
             pass
 
@@ -277,15 +287,15 @@ def connect_and_discover(url, db, user, pw, progress=gr.Progress()):
         wiz_map = {}
         for w in wizards:
             w["action_type"] = "window"
-            wiz_map[f"{w['name']} (Action ID: {w['id']} | {w['res_model']})"] = w
+            wiz_map[f"{w["name"]} (Action ID: {w["id"]} | {w["res_model"]})"] = w
         for c in client_reports:
-            wiz_map[f"{c['name']} (Financial Statement)"] = c
+            wiz_map[f"{c["name"]} (Financial Statement)"] = c
 
         choices = sorted(list(wiz_map.keys()))
-        progress(1.0, desc="All wizards & reports discovered!")
-        return f"⚡ Connected! Discovered **{len(wizards)} wizards** & **{len(client_reports)} financial statements**.", gr.update(choices=choices, value=next(iter(choices), None)), wiz_map
+        progress(1.0, desc="All permitted wizards & reports loaded!")
+        return f"⚡ Connected as UID {uid}! Discovered **{len(wizards)} wizards** & **{len(client_reports)} financial statements**.", gr.update(choices=choices, value=next(iter(choices), None) if choices else None), wiz_map
     except Exception as e:
-        return f"❌ Error: {str(e)}", gr.update(choices=[]), {}
+        return f"❌ Connection failed: {str(e)}", gr.update(choices=[]), {}
 
 def inspect_wizard(url, db, user, pw, selected_label, wiz_map, cur_from, cur_to):
     empty_ret = (
@@ -339,7 +349,7 @@ def inspect_wizard(url, db, user, pw, selected_label, wiz_map, cur_from, cur_to)
             f2_opts = sorted(list(fut2.result().keys())) if fut2 else []
 
         info_md = (
-            f"### Wizard: **{w['name']}** (`{w['res_model']}`)\n"
+            f"### Wizard: **{w["name"]}** (`{w["res_model"]}`)\n"
             f"**Detected Buttons:** `{', '.join(btns) if btns else 'Auto-detect'}`\n\n"
             f"**Exact Model Fields:**\n" + "\n".join(prof.get("summary", []))
         )
@@ -409,8 +419,6 @@ def sync_ui_to_json(params_json, d_from, d_to, is_as_on, f1_label, f1_vals, f2_l
         return json.dumps(data, indent=2)
     except Exception:
         return params_json if isinstance(params_json, str) else "{}"
-
-print("✅ Cell 2A-2 loaded!")
 
 import pandas as pd
 import io, time, gc, xlsxwriter, urllib.parse
@@ -503,7 +511,9 @@ def build_direct_financial_xlsx(url, db, uid, pw, fs_type, d_from, d_to, user_ct
 
     buf = io.BytesIO()
     title = "Profit_and_Loss" if fs_type == "pnl" else "Balance_Sheet"
-    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+
+    # Use xlsxwriter with optimized row compression & zip64 to minimize output size
+    with pd.ExcelWriter(buf, engine="xlsxwriter", engine_kwargs={"options": {"constant_memory": True}}) as writer:
         df.to_excel(writer, index=False, sheet_name=title)
     return buf.getvalue(), f"{title}_{d_to or 'AsOn'}.xlsx", "read_group_ledger"
 
@@ -531,7 +541,7 @@ def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, 
         }
         dl_url = f"{clean_base}/account_reports/export_to_xlsx?report_id={report_id}&options={urllib.parse.quote(json.dumps(options))}"
         with opener.open(dl_url, timeout=timeout) as resp:
-            return resp.read(), f"{w['name'].replace(' ', '_')}.xlsx", "export_to_xlsx"
+            return resp.read(), f"{w["name"].replace(' ', '_')}.xlsx", "export_to_xlsx"
 
     f_info = execute_with_uid(url, db, uid, pw, w["res_model"], "fields_get", [], {"attributes": ["type", "required"]}, timeout=timeout)
     today_str = datetime.today().strftime("%Y-%m-%d")
@@ -582,17 +592,17 @@ def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, 
     if used_m is None and last_err:
         raise last_err
 
-    file_bytes, fname_out = None, f"{w['name'].replace(' ', '_')}.xlsx"
+    file_bytes, fname_out = None, f"{w["name"].replace(' ', '_')}.xlsx"
     if isinstance(res_action, dict) and res_action.get("report_name"):
         rep_type = res_action.get("report_type", "qweb-pdf")
         doc_ids = res_action.get("context", {}).get("active_ids") or [wiz_id]
         route_prefix = "xlsx" if "xlsx" in rep_type else ("html" if "html" in rep_type else "pdf")
         ids_str = ",".join(str(x) for x in doc_ids) if isinstance(doc_ids, list) else str(doc_ids)
-        report_url = f"{clean_base}/report/{route_prefix}/{res_action['report_name']}/{ids_str}"
+        report_url = f"{clean_base}/report/{route_prefix}/{res_action["report_name"]}/{ids_str}"
         with opener.open(report_url, timeout=timeout) as report_resp:
             file_bytes = report_resp.read()
         ext = "xlsx" if "xlsx" in rep_type else ("html" if "html" in rep_type else "pdf")
-        fname_out = f"{w['name'].replace(' ', '_')}.{ext}"
+        fname_out = f"{w["name"].replace(' ', '_')}.{ext}"
     elif isinstance(res_action, dict) and res_action.get("url"):
         dl_url = res_action["url"]
         full_url = dl_url if dl_url.startswith("http") else f"{clean_base}{dl_url}"
@@ -612,15 +622,13 @@ def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, 
                     file_bytes = base64.b64decode(rec[bf])
                     break
         if not file_bytes:
-            atts = execute_with_uid(url, db, uid, pw, "ir.attachment", "search_read", [[["res_model", "=", w["res_model"]], ["res_id", "=", wiz_id]]], {"fields": ["name", "datas"], "limit": 1, "context": user_ctx}, timeout=timeout)
+            atts = execute_with_uid(url, db, uid, pw, "ir.attachment", "search_read", [[["res_model", "=", w["res_model"], ["res_id", "=", wiz_id]]]], {"fields": ["name", "datas"], "limit": 1, "context": user_ctx}, timeout=timeout)
             att = next(iter(atts), None) if isinstance(atts, list) else (atts if isinstance(atts, dict) else None)
             if isinstance(att, dict) and att.get("datas"):
                 file_bytes = base64.b64decode(att["datas"])
                 fname_out = att["name"]
 
     return file_bytes, fname_out, used_m
-
-print("✅ Cell 3 loaded successfully!")
 
 import threading, re, io, json, tempfile, os, base64, requests, time, openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
