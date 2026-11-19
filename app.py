@@ -1114,6 +1114,8 @@ subprocess.run(["pkill", "-f", "frpc"], check=False)
 gr.close_all()
 
 
+# Cell merged into Cell 7 above and no longer required.
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     demo.launch(
