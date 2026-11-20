@@ -294,9 +294,9 @@ def connect_and_discover(url, db, user, pw, progress=gr.Progress()):
         wiz_map = {}
         for w in wizards:
             w["action_type"] = "window"
-            wiz_map[f"{w["name"]} (Action ID: {w["id"]} | {w["res_model"]})"] = w
+            wiz_map[f"{w['name']} (Action ID: {w['id']} | {w['res_model']})"] = w
         for c in client_reports:
-            wiz_map[f"{c["name"]} (Financial Statement)"] = c
+            wiz_map[f"{c['name']} (Financial Statement)"] = c
 
         choices = sorted(list(wiz_map.keys()))
         progress(1.0, desc="All permitted wizards & reports loaded!")
@@ -356,7 +356,7 @@ def inspect_wizard(url, db, user, pw, selected_label, wiz_map, cur_from, cur_to)
             f2_opts = sorted(list(fut2.result().keys())) if fut2 else []
 
         info_md = (
-            f"### Wizard: **{w["name"]}** (`{w["res_model"]}`)\n"
+            f"### Wizard: **{w['name']}** (`{w['res_model']}`)\n"
             f"**Detected Buttons:** `{', '.join(btns) if btns else 'Auto-detect'}`\n\n"
             f"**Exact Model Fields:**\n" + "\n".join(prof.get("summary", []))
         )
@@ -389,7 +389,7 @@ def on_rel_field_change(url, db, user, pw, rel_field_label, rel_fields_map):
     except Exception:
         return gr.update(choices=[], value=[]), rel_fields_map
 
-def sync_ui_to_json(params_json, d_from, d_to, is_as_on, f1_label, f1_vals, f2_label, f2_vals, rel_fields_map, selected_label=None, wiz_map=None):
+def sync_ui_to_json(params_json="{}", d_from="", d_to="", is_as_on=False, f1_label=None, f1_vals=None, f2_label=None, f2_vals=None, rel_fields_map=None, selected_label=None, wiz_map=None):
     try:
         try:
             data = json.loads(params_json) if (isinstance(params_json, str) and params_json.strip()) else {}
