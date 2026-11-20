@@ -124,10 +124,10 @@ def fetch_rel_options(url, db, uid, pw, rel_meta, wiz_name=""):
     rel_model = rel_meta["relation"]
     search_arg = "GRIR" if (rel_model == "account.account" and "grir" in wiz_name.lower()) else ""
     try:
-        pairs = execute_with_uid(url, db, uid, pw, rel_model, "name_search", [], {"name": search_arg, "limit": 100000}, timeout=120)
+        pairs = execute_with_uid(url, db, uid, pw, rel_model, "name_search", [], {"name": search_arg, "limit": 2000}, timeout=60)
         if not pairs and search_arg:
-            pairs = execute_with_uid(url, db, uid, pw, rel_model, "name_search", [], {"name": "", "limit": 100000}, timeout=120)
-        opt_map = {f"{p[1]} (ID:{p[0]})": p[0] for p in (pairs or []) if isinstance(p, (list, tuple)) and len(p) >= 2}
+            pairs = execute_with_uid(url, db, uid, pw, rel_model, "name_search", [], {"name": "", "limit": 2000}, timeout=60)
+        opt_map = {f"{p} (ID:{p})": p for p in (pairs or []) if isinstance(p, (list, tuple)) and len(p) >= 2}
         rel_meta["options"] = opt_map
         rel_meta["loaded"] = True
         return opt_map
@@ -204,7 +204,7 @@ def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
         req_tag = " [REQUIRED]" if req else ""
 
         if ftype == "selection" and meta.get("selection"):
-            opts = ", ".join(f"`{x[0]}` ({x[1]})" for x in meta["selection"] if isinstance(x, (list, tuple)) and len(x) >= 2)
+            opts = ", ".join(f"`{x}` ({x})" for x in meta["selection"] if isinstance(x, (list, tuple)) and len(x) >= 2)
             field_summary.append(f"- `{fname}` ({ftype}{req_tag}): {label} -> Options: {opts}")
         else:
             field_summary.append(f"- `{fname}` ({ftype}{req_tag}): {label}")
@@ -215,7 +215,7 @@ def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
             (start_fields if is_start else end_fields).append((fname, ftype))
             if fname in default_vals and default_vals[fname]:
                 clean_def = to_odoo_date(default_vals[fname])
-                if len(clean_def) >= 10 and clean_def[4] == "-":
+                if len(clean_def) >= 10 and clean_def == "-":
                     default_vals[fname] = f"{clean_def[:10]} 00:00:00" if (ftype == "datetime" and len(clean_def) == 10) else clean_def
                 else:
                     default_vals[fname] = False
@@ -224,9 +224,9 @@ def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
                 default_vals[fname] = f"{raw_d} 00:00:00" if ftype == "datetime" else raw_d
 
         elif ftype == "selection" and meta.get("selection") and fname not in default_vals:
-            valid = [item[0] for item in meta["selection"] if isinstance(item, (list, tuple)) and len(item) >= 2]
+            valid = [item for item in meta["selection"] if isinstance(item, (list, tuple)) and len(item) >= 2]
             if valid:
-                default_vals[fname] = valid[0]
+                default_vals[fname] = valid
 
         elif ftype in ("many2one", "many2many") and meta.get("relation"):
             rel_model = meta["relation"]
@@ -253,7 +253,7 @@ def build_wizard_profile(url, db, uid, pw, w, cur_from="", cur_to=""):
     save_disk_cache(PROFILE_CACHE)
     return prof
 
-print("✅ Cell 310fTof7mloq fully restored and configured with 100k limits!")
+print("✅ Cell 2 verified and loaded!")
 
 def connect_and_discover(url, db, user, pw, progress=gr.Progress()):
     try:
@@ -628,7 +628,6 @@ def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, 
 
     file_bytes, fname_out = None, f"{w['name'].replace(' ', '_')}.xlsx"
 
-    # Case 1: Standard Odoo Report Action (QWeb PDF / XLSX / HTML)
     if isinstance(res_action, dict) and res_action.get("report_name"):
         rep_type = res_action.get("report_type", "qweb-pdf")
         act_ctx = res_action.get("context") or {}
@@ -641,6 +640,23 @@ def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, 
         ext = "xlsx" if "xlsx" in rep_type else ("html" if "html" in rep_type else "pdf")
         fname_out = f"{w['name'].replace(' ', '_')}.{ext}"
 
+    elif isinstance(res_action, dict) and res_action.get("url"):
+        dl_url = res_action["url"]
+    if download_stats and file_bytes:
+        download_stats["bytes"] = len(file_bytes)
+
+    return file_bytes, fname_out, used_m or "native_wizard"
+
+def execute_report_smart(url, db, uid, pw, opener, clean_base, w, wiz_vals, btn_method, user_ctx, download_stats=None, run_flag=None):
+    res = fetch_single_wizard_fast(
+        url, db, uid, pw, opener, clean_base, w, wiz_vals, btn_method, user_ctx,
+        timeout=1800, download_stats=download_stats
+    )
+    if not res or not isinstance(res, tuple) or len(res) != 3:
+        return None, f"{w.get('name', 'Report').replace(' ', '_')}.xlsx", "failed_no_output"
+    return res
+
+print("✅ Cell 4 verified and loaded!")
 
 import threading, re, io, json, tempfile, os, base64, requests, time, openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
