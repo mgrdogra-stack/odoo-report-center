@@ -450,7 +450,7 @@ def build_direct_financial_xlsx(url, db, uid, pw, fs_type, d_from, d_to, user_ct
     type_field = "account_type" if "account_type" in acc_fields else ("user_type_id" if "user_type_id" in acc_fields else None)
     fields_to_read = ["id", "code", "name"] + ([type_field] if type_field else [])
     accounts = execute_with_uid(url, db, uid, pw, "account.account", "search_read", [[]], {"fields": fields_to_read, "limit": 5000}, timeout=180)
-    acc_map = {a["id"]: a for a in accounts}
+    acc_map = {a["id"]: a for a in (accounts or [])}
 
     chunks = get_date_chunks(d_from, d_to, max_days=30) if (d_from and d_to) else [(d_from, d_to)]
     grouped_results = []
