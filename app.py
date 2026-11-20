@@ -428,7 +428,7 @@ def sync_ui_to_json(params_json="{}", d_from="", d_to="", is_as_on=False, f1_lab
         return params_json if isinstance(params_json, str) else "{}"
 
 import pandas as pd
-import io, time, gc, xlsxwriter, urllib.parse
+import io, time, gc, base64, xlsxwriter, urllib.parse
 from datetime import datetime, timedelta
 
 def get_date_chunks(start_str, end_str, max_days=31):
@@ -475,7 +475,7 @@ def build_direct_financial_xlsx(url, db, uid, pw, fs_type, d_from, d_to, user_ct
         acc_ref = g.get("account_id")
         if not acc_ref:
             continue
-        acc_id = acc_ref if isinstance(acc_ref, (list, tuple)) else acc_ref
+        acc_id = acc_ref[0] if isinstance(acc_ref, (list, tuple)) else acc_ref
         if acc_id not in consolidated:
             consolidated[acc_id] = {"account_id": acc_ref, "debit": 0.0, "credit": 0.0, "balance": 0.0}
         consolidated[acc_id]["debit"] += float(g.get("debit", 0.0) or 0.0)
@@ -491,7 +491,7 @@ def build_direct_financial_xlsx(url, db, uid, pw, fs_type, d_from, d_to, user_ct
     for acc_id, totals in consolidated.items():
         acc = acc_map.get(acc_id, {})
         raw_type = acc.get(type_field, "")
-        type_str = raw_type if isinstance(raw_type, (list, tuple)) and len(raw_type) >= 2 else str(raw_type or "")
+        type_str = raw_type[1] if isinstance(raw_type, (list, tuple)) and len(raw_type) >= 2 else str(raw_type or "")
         low_t = type_str.lower()
 
         is_pnl_acc = any(k in low_t for k in pnl_keys)
@@ -559,11 +559,12 @@ def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, 
                 "date_to": wiz_vals.get("date_to"),
                 "filter": "custom",
                 "mode": "range",
-            }
+            },
+            "unfold_all": True,
         }
         dl_url = f"{clean_base}/account_reports/export_to_xlsx?report_id={report_id}&options={urllib.parse.quote(json.dumps(options))}"
         if download_stats:
-            download_stats["stage"] = "Streaming native Odoo financial report..."
+            download_stats["stage"] = "Streaming native Odoo financial report (unfolded details)..."
         with opener.open(dl_url, timeout=timeout) as resp:
             data = resp.read()
             if download_stats:
@@ -579,7 +580,7 @@ def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, 
         ftype = f_info[k].get("type")
         if ftype in ("date", "datetime"):
             cleaned = to_odoo_date(v) if v else (today_str if f_info[k].get("required") else "")
-            if len(cleaned) >= 10 and cleaned == "-":
+            if len(cleaned) >= 10 and cleaned[4] == "-":
                 safe_vals[k] = f"{cleaned[:10]} 00:00:00" if (ftype == "datetime" and len(cleaned) == 10) else cleaned
             else:
                 safe_vals[k] = False
@@ -626,9 +627,12 @@ def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, 
         download_stats["stage"] = "Downloading compiled file from Odoo..."
 
     file_bytes, fname_out = None, f"{w['name'].replace(' ', '_')}.xlsx"
+
+    # Case 1: Standard Odoo Report Action (QWeb PDF / XLSX / HTML)
     if isinstance(res_action, dict) and res_action.get("report_name"):
         rep_type = res_action.get("report_type", "qweb-pdf")
-        doc_ids = res_action.get("context", {}).get("active_ids") or [wiz_id]
+        act_ctx = res_action.get("context") or {}
+        doc_ids = act_ctx.get("active_ids") or [wiz_id]
         route_prefix = "xlsx" if "xlsx" in rep_type else ("html" if "html" in rep_type else "pdf")
         ids_str = ",".join(str(x) for x in doc_ids) if isinstance(doc_ids, list) else str(doc_ids)
         report_url = f"{clean_base}/report/{route_prefix}/{res_action['report_name']}/{ids_str}"
@@ -636,9 +640,7 @@ def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, 
             file_bytes = report_resp.read()
         ext = "xlsx" if "xlsx" in rep_type else ("html" if "html" in rep_type else "pdf")
         fname_out = f"{w['name'].replace(' ', '_')}.{ext}"
-    elif isinstance(res_action, dict) and res_action.get("url"):
-        dl_url = res_action["url"]
-        full_url = dl_url if dl_url.startswith("http") else f"{clean_base}{dl_url}"
+
 
 import threading, re, io, json, tempfile, os, base64, requests, time, openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
