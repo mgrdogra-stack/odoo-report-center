@@ -438,6 +438,21 @@ def execute_with_uid(url, db, uid, pw, model, method, args, kwargs=None, timeout
         call_args.append(kwargs)
     return odoo_jsonrpc(url, "object", "execute_kw", call_args, timeout=timeout)
 
+def get_date_chunks(start_str, end_str, max_days=31):
+    try:
+        s_dt = datetime.strptime(start_str, "%Y-%m-%d")
+        e_dt = datetime.strptime(end_str, "%Y-%m-%d")
+    except Exception:
+        return [(start_str, end_str)] if start_str and end_str else []
+
+    chunks = []
+    curr = s_dt
+    while curr <= e_dt:
+        chunk_end = min(curr + timedelta(days=max_days), e_dt)
+        chunks.append((curr.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d")))
+        curr = chunk_end + timedelta(days=1)
+    return chunks
+
 def build_direct_financial_xlsx(url, db, uid, pw, fs_type, d_from, d_to, user_ctx, timeout=900):
     acc_fields = execute_with_uid(url, db, uid, pw, "account.account", "fields_get", [], {"attributes": ["type"]}, timeout=60)
     type_field = "account_type" if "account_type" in acc_fields else ("user_type_id" if "user_type_id" in acc_fields else None)
@@ -445,21 +460,47 @@ def build_direct_financial_xlsx(url, db, uid, pw, fs_type, d_from, d_to, user_ct
     accounts = execute_with_uid(url, db, uid, pw, "account.account", "search_read", [[]], {"fields": fields_to_read, "limit": 5000}, timeout=120)
     acc_map = {a["id"]: a for a in accounts}
 
-    domain = [["parent_state", "=", "posted"]]
-    if fs_type == "pnl":
-        if d_from:
-            domain.append(["date", ">=", d_from])
-        if d_to:
-            domain.append(["date", "<=", d_to])
-    else:
-        if d_to:
-            domain.append(["date", "<=", d_to])
+    # Determine chunks to avoid Odoo Gateway timeout limits
+    chunks = get_date_chunks(d_from, d_to, max_days=30) if (d_from and d_to) else [(d_from, d_to)]
+    grouped_results = []
 
-    grouped = execute_with_uid(
-        url, db, uid, pw, "account.move.line", "read_group",
-        [domain, ["account_id", "debit", "credit", "balance"], ["account_id"]],
-        {"lazy": False}, timeout=timeout
-    )
+    for c_from, c_to in chunks:
+        domain = [["parent_state", "=", "posted"]]
+        if fs_type == "pnl":
+            if c_from: domain.append(["date", ">=", c_from])
+            if c_to: domain.append(["date", "<=", c_to])
+        else:
+            if c_to: domain.append(["date", "<=", c_to])
+
+        try:
+            chunk_grouped = execute_with_uid(
+                url, db, uid, pw, "account.move.line", "read_group",
+                [domain, ["account_id", "debit", "credit", "balance"], ["account_id"]],
+                {"lazy": False}, timeout=timeout
+            ) or []
+            grouped_results.extend(chunk_grouped)
+        except Exception as chunk_err:
+            # If a chunk fails, retry with an extended timeout once
+            time.sleep(2)
+            chunk_grouped = execute_with_uid(
+                url, db, uid, pw, "account.move.line", "read_group",
+                [domain, ["account_id", "debit", "credit", "balance"], ["account_id"]],
+                {"lazy": False}, timeout=timeout + 300
+            ) or []
+            grouped_results.extend(chunk_grouped)
+
+    # Consolidate chunked results
+    consolidated = {}
+    for g in grouped_results:
+        acc_ref = g.get("account_id")
+        if not acc_ref:
+            continue
+        acc_id = acc_ref[0] if isinstance(acc_ref, (list, tuple)) else acc_ref
+        if acc_id not in consolidated:
+            consolidated[acc_id] = {"account_id": acc_ref, "debit": 0.0, "credit": 0.0, "balance": 0.0}
+        consolidated[acc_id]["debit"] += float(g.get("debit", 0.0) or 0.0)
+        consolidated[acc_id]["credit"] += float(g.get("credit", 0.0) or 0.0)
+        consolidated[acc_id]["balance"] += float(g.get("balance", 0.0) or 0.0)
 
     pnl_keys = ("income", "expense", "cost_of_revenue", "depreciation")
     bs_keys = ("asset", "liability", "equity", "receivable", "payable", "liquidity", "credit_card")
@@ -467,11 +508,7 @@ def build_direct_financial_xlsx(url, db, uid, pw, fs_type, d_from, d_to, user_ct
     rows = []
     net_earnings = 0.0
 
-    for g in grouped:
-        acc_ref = g.get("account_id")
-        if not acc_ref:
-            continue
-        acc_id = acc_ref[0] if isinstance(acc_ref, (list, tuple)) else acc_ref
+    for acc_id, totals in consolidated.items():
         acc = acc_map.get(acc_id, {})
         raw_type = acc.get(type_field, "")
         type_str = raw_type[1] if isinstance(raw_type, (list, tuple)) and len(raw_type) >= 2 else str(raw_type or "")
@@ -480,9 +517,9 @@ def build_direct_financial_xlsx(url, db, uid, pw, fs_type, d_from, d_to, user_ct
         is_pnl_acc = any(k in low_t for k in pnl_keys)
         is_bs_acc = any(k in low_t for k in bs_keys)
 
-        debit = float(g.get("debit", 0.0) or 0.0)
-        credit = float(g.get("credit", 0.0) or 0.0)
-        balance = float(g.get("balance", debit - credit) or 0.0)
+        debit = totals["debit"]
+        credit = totals["credit"]
+        balance = totals["balance"]
 
         if is_pnl_acc:
             net_earnings += -balance
@@ -496,7 +533,7 @@ def build_direct_financial_xlsx(url, db, uid, pw, fs_type, d_from, d_to, user_ct
 
         rows.append({
             "Account Code": acc.get("code", ""),
-            "Account Name": acc.get("name", str(acc_ref)),
+            "Account Name": acc.get("name", str(totals["account_id"])),
             "Account Type": type_str,
             "Debit": round(debit, 2),
             "Credit": round(credit, 2),
@@ -520,12 +557,15 @@ def build_direct_financial_xlsx(url, db, uid, pw, fs_type, d_from, d_to, user_ct
     buf = io.BytesIO()
     title = "Profit_and_Loss" if fs_type == "pnl" else "Balance_Sheet"
 
-    # Use xlsxwriter with optimized row compression & zip64 to minimize output size
     with pd.ExcelWriter(buf, engine="xlsxwriter", engine_kwargs={"options": {"constant_memory": True}}) as writer:
         df.to_excel(writer, index=False, sheet_name=title)
+
+    del df, rows, consolidated, grouped_results
+    gc.collect()
+
     return buf.getvalue(), f"{title}_{d_to or 'AsOn'}.xlsx", "read_group_ledger"
 
-def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, btn_method, user_ctx, timeout=900):
+def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, btn_method, user_ctx, timeout=1200):
     if w.get("action_type") == "direct_fs":
         return build_direct_financial_xlsx(url, db, uid, pw, w.get("fs_type", "pnl"), wiz_vals.get("date_from"), wiz_vals.get("date_to"), user_ctx, timeout=timeout)
 
@@ -621,7 +661,6 @@ def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, 
     else:
         bin_fields = [k for k, v in f_info.items() if v.get("type") == "binary"]
         char_fields = [k for k, v in f_info.items() if v.get("type") == "char"]
-        # Perform reading of fields in parallel batches to speed up slow database exports
         recs = execute_with_uid(url, db, uid, pw, w["res_model"], "read", [[wiz_id]], {"fields": bin_fields + char_fields, "context": user_ctx}, timeout=timeout)
         rec = next(iter(recs), None) if isinstance(recs, list) else (recs if isinstance(recs, dict) else None)
         if isinstance(rec, dict):
