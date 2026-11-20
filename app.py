@@ -428,124 +428,217 @@ def sync_ui_to_json(params_json="{}", d_from="", d_to="", is_as_on=False, f1_lab
         return params_json if isinstance(params_json, str) else "{}"
 
 import pandas as pd
-import openpyxl, io, gc, time
+import io, time, gc, xlsxwriter, urllib.parse
+from datetime import datetime, timedelta
 
-def get_chunkable_dimension(url, db, uid, pw, w, wiz_vals):
-    """Finds a relational field (Category, Account, Location, Warehouse) to split heavy reports without duplicating dates/opening balances."""
-    prof = w.get("profile", {})
-    rel_fields = prof.get("rel_fields", {})
-    priority_patterns = ["categ", "category", "account", "location", "warehouse", "journal"]
+def get_date_chunks(start_str, end_str, max_days=31):
+    try:
+        s_dt = datetime.strptime(start_str, "%Y-%m-%d")
+        e_dt = datetime.strptime(end_str, "%Y-%m-%d")
+    except Exception:
+        return [(start_str, end_str)] if start_str and end_str else []
+    chunks = []
+    curr = s_dt
+    while curr <= e_dt:
+        chunk_end = min(curr + timedelta(days=max_days), e_dt)
+        chunks.append((curr.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d")))
+        curr = chunk_end + timedelta(days=1)
+    return chunks
 
-    for pat in priority_patterns:
-        for label, meta in rel_fields.items():
-            fname = meta["field"]
-            ftype = meta["type"]
-            # Only auto-chunk if the user left this filter empty (meaning 'All')
-            cur_val = wiz_vals.get(fname)
-            is_empty = not cur_val or (isinstance(cur_val, list) and len(cur_val) > 0 and len(cur_val[0]) >= 3 and not cur_val[0][2])
-            if pat in fname.lower() or pat in label.lower():
-                if is_empty:
-                    opts = fetch_rel_options(url, db, uid, pw, meta, w.get("name", ""))
-                    if opts and len(opts) > 1:
-                        return fname, ftype, list(opts.items())
-    return None, None, []
+def build_direct_financial_xlsx(url, db, uid, pw, fs_type, d_from, d_to, user_ctx, timeout=1800):
+    acc_fields = execute_with_uid(url, db, uid, pw, "account.account", "fields_get", [], {"attributes": ["type"]}, timeout=120)
+    type_field = "account_type" if "account_type" in acc_fields else ("user_type_id" if "user_type_id" in acc_fields else None)
+    fields_to_read = ["id", "code", "name"] + ([type_field] if type_field else [])
+    accounts = execute_with_uid(url, db, uid, pw, "account.account", "search_read", [[]], {"fields": fields_to_read, "limit": 5000}, timeout=180)
+    acc_map = {a["id"]: a for a in accounts}
 
-def clean_and_merge_xlsx_chunks(chunk_bytes_list, sheet_title="Consolidated_Report"):
-    """Merges multiple Odoo Excel exports cleanly: keeps header once, strips repeated banners & subtotal/total rows to prevent double counting."""
-    master_wb = openpyxl.Workbook(write_only=True)
-    master_ws = master_wb.create_sheet(title=sheet_title[:31])
+    chunks = get_date_chunks(d_from, d_to, max_days=30) if (d_from and d_to) else [(d_from, d_to)]
+    grouped_results = []
 
-    header_written = False
-    header_signature = None
+    for c_from, c_to in chunks:
+        domain = [["parent_state", "=", "posted"]]
+        if fs_type == "pnl":
+            if c_from: domain.append(["date", ">=", c_from])
+            if c_to: domain.append(["date", "<=", c_to])
+        else:
+            if c_to: domain.append(["date", "<=", c_to])
 
-    for idx, b_data in enumerate(chunk_bytes_list):
-        if not b_data:
+        chunk_grouped = execute_with_uid(
+            url, db, uid, pw, "account.move.line", "read_group",
+            [domain, ["account_id", "debit", "credit", "balance"], ["account_id"]],
+            {"lazy": False}, timeout=timeout
+        ) or []
+        grouped_results.extend(chunk_grouped)
+
+    consolidated = {}
+    for g in grouped_results:
+        acc_ref = g.get("account_id")
+        if not acc_ref:
             continue
-        wb = openpyxl.load_workbook(io.BytesIO(b_data), read_only=True, data_only=True)
-        ws = wb[wb.sheetnames[0]]
+        acc_id = acc_ref[0] if isinstance(acc_ref, (list, tuple)) else acc_ref
+        if acc_id not in consolidated:
+            consolidated[acc_id] = {"account_id": acc_ref, "debit": 0.0, "credit": 0.0, "balance": 0.0}
+        consolidated[acc_id]["debit"] += float(g.get("debit", 0.0) or 0.0)
+        consolidated[acc_id]["credit"] += float(g.get("credit", 0.0) or 0.0)
+        consolidated[acc_id]["balance"] += float(g.get("balance", 0.0) or 0.0)
 
-        found_header_in_chunk = False
-        for r_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
-            # Skip completely empty rows
-            if not any(cell is not None and str(cell).strip() != "" for cell in row):
-                continue
+    pnl_keys = ("income", "expense", "cost_of_revenue", "depreciation")
+    bs_keys = ("asset", "liability", "equity", "receivable", "payable", "liquidity", "credit_card")
 
-            row_strs = [str(c or "").strip().lower() for c in row]
-            non_empty = [s for s in row_strs if s]
+    rows = []
+    net_earnings = 0.0
 
-            # Detect table header row (contains typical column names)
-            is_header = any(k in row_strs for k in ("product", "date", "reference", "debit", "credit", "balance", "qty", "quantity", "code", "account", "voucher")) and len(non_empty) >= 3
+    for acc_id, totals in consolidated.items():
+        acc = acc_map.get(acc_id, {})
+        raw_type = acc.get(type_field, "")
+        type_str = raw_type[1] if isinstance(raw_type, (list, tuple)) and len(raw_type) >= 2 else str(raw_type or "")
+        low_t = type_str.lower()
 
-            if not found_header_in_chunk:
-                if is_header:
-                    found_header_in_chunk = True
-                    if not header_written:
-                        master_ws.append(list(row))
-                        header_signature = tuple(row_strs[:6])
-                        header_written = True
-                elif idx == 0 and r_idx <= 5:
-                    # Keep top report title block only from the very first chunk
-                    master_ws.append(list(row))
-                continue
+        is_pnl_acc = any(k in low_t for k in pnl_keys)
+        is_bs_acc = any(k in low_t for k in bs_keys)
+        debit, credit, balance = totals["debit"], totals["credit"], totals["balance"]
 
-            # Skip repeated header rows inside chunks
-            if tuple(row_strs[:6]) == header_signature:
-                continue
+        if is_pnl_acc:
+            net_earnings += -balance
+        if fs_type == "pnl" and not is_pnl_acc:
+            continue
+        if fs_type == "bs" and not is_bs_acc:
+            continue
 
-            # Skip grand total / summary rows per chunk so TB reconciliation doesn't double-count
-            first_few = " ".join(row_strs[:4])
-            if any(t in first_few for t in ("grand total", "total value", "total amount", "report total")):
-                continue
+        display_amt = -balance if any(k in low_t for k in ("income", "liability", "payable", "equity")) else balance
+        rows.append({
+            "Account Code": acc.get("code", ""),
+            "Account Name": acc.get("name", str(totals["account_id"])),
+            "Account Type": type_str,
+            "Debit": round(debit, 2),
+            "Credit": round(credit, 2),
+            "Net Balance": round(display_amt, 2),
+        })
 
-            master_ws.append(list(row))
-        wb.close()
+    if fs_type == "bs" and round(net_earnings, 2) != 0.0:
+        rows.append({
+            "Account Code": "999999",
+            "Account Name": "Current Year Unallocated Earnings (Net Profit / Loss)",
+            "Account Type": "equity_unaffected",
+            "Debit": round(max(-net_earnings, 0.0), 2),
+            "Credit": round(max(net_earnings, 0.0), 2),
+            "Net Balance": round(net_earnings, 2),
+        })
 
-    out_buf = io.BytesIO()
-    master_wb.save(out_buf)
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values(by=["Account Type", "Account Code"])
+
+    buf = io.BytesIO()
+    title = "Profit_and_Loss" if fs_type == "pnl" else "Balance_Sheet"
+    with pd.ExcelWriter(buf, engine="xlsxwriter", engine_kwargs={"options": {"constant_memory": True}}) as writer:
+        df.to_excel(writer, index=False, sheet_name=title)
+
+    del df, rows, consolidated, grouped_results
     gc.collect()
-    return out_buf.getvalue()
+    return buf.getvalue(), f"{title}_{d_to or 'AsOn'}.xlsx", "read_group_ledger"
 
-def execute_report_smart(url, db, uid, pw, opener, clean_base, w, wiz_vals, btn_method, user_ctx, download_stats, run_flag):
-    # Direct financial statements and client actions already use fast grouped queries
-    if w.get("action_type") in ("direct_fs", "client"):
-        return fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, btn_method, user_ctx, timeout=900)
+def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, btn_method, user_ctx, timeout=1800, download_stats=None):
+    """Executes Odoo's native wizard untouched and streams the raw file bytes directly."""
+    if w.get("action_type") == "direct_fs":
+        return build_direct_financial_xlsx(url, db, uid, pw, w.get("fs_type", "pnl"), wiz_vals.get("date_from"), wiz_vals.get("date_to"), user_ctx, timeout=timeout)
 
-    # Check if we can split a heavy report by Category / Location / Account (Zero date splitting = Zero duplicate opening balances)
-    chunk_field, chunk_type, items = get_chunkable_dimension(url, db, uid, pw, w, wiz_vals)
+    if w.get("action_type") == "client":
+        ctx = dict(user_ctx)
+        if isinstance(w.get("context"), str):
+            try:
+                ctx.update(json.loads(w["context"].replace("'", '"')))
+            except Exception:
+                pass
+        elif isinstance(w.get("context"), dict):
+            ctx.update(w["context"])
+        report_id = ctx.get("report_id") or (w.get("params") or {}).get("report_id") or w["id"]
+        options = {
+            "date": {
+                "date_from": wiz_vals.get("date_from"),
+                "date_to": wiz_vals.get("date_to"),
+                "filter": "custom",
+                "mode": "range",
+            }
+        }
+        dl_url = f"{clean_base}/account_reports/export_to_xlsx?report_id={report_id}&options={urllib.parse.quote(json.dumps(options))}"
+        if download_stats:
+            download_stats["stage"] = "Streaming native Odoo financial report..."
+        with opener.open(dl_url, timeout=timeout) as resp:
+            data = resp.read()
+            if download_stats:
+                download_stats["bytes"] = len(data)
+            return data, f"{w['name'].replace(' ', '_')}.xlsx", "export_to_xlsx"
 
-    if chunk_field and len(items) > 1:
-        chunk_files = []
-        last_fname = f"{w['name'].replace(' ', '_')}.xlsx"
-        # Batch items into groups of 3 to balance speed and server load
-        batch_size = 3 if chunk_type == "many2many" else 1
-        batches = [items[i:i + batch_size] for i in range(0, len(items), batch_size)]
+    f_info = execute_with_uid(url, db, uid, pw, w["res_model"], "fields_get", [], {"attributes": ["type", "required"]}, timeout=120)
+    today_str = datetime.today().strftime("%Y-%m-%d")
+    safe_vals = {}
+    for k, v in wiz_vals.items():
+        if k not in f_info:
+            continue
+        ftype = f_info[k].get("type")
+        if ftype in ("date", "datetime"):
+            cleaned = to_odoo_date(v) if v else (today_str if f_info[k].get("required") else "")
+            if len(cleaned) >= 10 and cleaned[4] == "-":
+                safe_vals[k] = f"{cleaned[:10]} 00:00:00" if (ftype == "datetime" and len(cleaned) == 10) else cleaned
+            else:
+                safe_vals[k] = False
+        else:
+            safe_vals[k] = v
 
-        for b_idx, batch in enumerate(batches, start=1):
-            if run_flag["stop"]:
-                raise Exception("Request cancelled by user.")
+    for k, meta in f_info.items():
+        if meta.get("required") and meta.get("type") in ("date", "datetime") and not safe_vals.get(k):
+            safe_vals[k] = f"{today_str} 00:00:00" if meta["type"] == "datetime" else today_str
 
-            labels = ", ".join(x[0].split(" (ID:")[0] for x in batch)
-            download_stats["stage"] = f"Batch {b_idx}/{len(batches)}: Extracting [{labels[:45]}]..."
+    if download_stats:
+        download_stats["stage"] = "Creating native Odoo wizard record..."
+    wiz_id = execute_with_uid(url, db, uid, pw, w["res_model"], "create", [safe_vals], {"context": user_ctx}, timeout=120)
 
-            sub_vals = dict(wiz_vals)
-            ids = [x[1] for x in batch]
-            sub_vals[chunk_field] = [[6, 0, ids]] if chunk_type == "many2many" else ids[0]
+    prof_btns = w.get("profile", {}).get("buttons", [])
+    candidates = list(dict.fromkeys(
+        ([btn_method.strip()] if btn_method and btn_method.strip() else [])
+        + prof_btns
+        + ["action_print_report", "print_report", "generate_report", "export_xls", "action_print_xlsx", "check_report", "print_xlsx", "action_export_xlsx"]
+    ))
 
-            b_data, f_name, used_m = fetch_single_wizard_fast(
-                url, db, uid, pw, opener, clean_base, w, sub_vals, btn_method, user_ctx, timeout=600
-            )
-            last_fname = f_name
-            if b_data:
-                chunk_files.append(b_data)
-                download_stats["bytes"] += len(b_data)
+    if download_stats:
+        download_stats["stage"] = "Odoo is compiling native report (preserving all movements & adjustments)..."
+    res_action, used_m, last_err = None, None, None
+    for m in candidates:
+        try:
+            res_action = execute_with_uid(url, db, uid, pw, w["res_model"], m, [[wiz_id]], {"context": user_ctx}, timeout=timeout)
+            used_m = m
+            break
+        except Exception as e:
+            err_s = str(e)
+            if "cannot marshal None" in err_s:
+                used_m = m
+                break
+            if "has no attribute" in err_s or "does not exist" in err_s:
+                last_err = e
+                continue
+            raise
 
-        if chunk_files:
-            download_stats["stage"] = f"Consolidating {len(chunk_files)} clean batches with zero duplicates..."
-            merged_bytes = clean_and_merge_xlsx_chunks(chunk_files, sheet_title=w["name"])
-            return merged_bytes, last_fname, "dimension_chunked"
+    if used_m is None and last_err:
+        raise last_err
 
-    # Fallback: single run if already filtered by user or no split dimension exists
-    return fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, btn_method, user_ctx, timeout=900)
+    if download_stats:
+        download_stats["stage"] = "Streaming native binary file from Odoo..."
+
+    file_bytes, fname_out = None, f"{w['name'].replace(' ', '_')}.xlsx"
+    if isinstance(res_action, dict) and res_action.get("report_name"):
+        rep_type = res_action.get("report_type", "qweb-pdf")
+        doc_ids = res_action.get("context", {}).get("active_ids") or [wiz_id]
+        route_prefix = "xlsx" if "xlsx" in rep_type else ("html" if "html" in rep_type else "pdf")
+        ids_str = ",".join(str(x) for x in doc_ids) if isinstance(doc_ids, list) else str(doc_ids)
+        report_url = f"{clean_base}/report/{route_prefix}/{res_action['report_name']}/{ids_str}"
+        with opener.open(report_url, timeout=timeout) as report_resp:
+            file_bytes = report_resp.read()
+        ext = "xlsx" if "xlsx" in rep_type else ("html" if "html" in rep_type else "pdf")
+        fname_out = f"{w['name'].replace(' ', '_')}.{ext}"
+    elif isinstance(res_action, dict) and res_action.get("url"):
+        dl_url = res_action["url"]
+        full_url = dl_url if dl_url.startswith("http") else f"{clean_base}{dl_url}"
 
 import threading, re, io, json, tempfile, os, base64, requests, time, openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
