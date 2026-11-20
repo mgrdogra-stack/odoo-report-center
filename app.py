@@ -432,7 +432,7 @@ import io, time, gc, xlsxwriter, urllib.parse
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 
-def execute_with_uid(url, db, uid, pw, model, method, args, kwargs=None, timeout=900):
+def execute_with_uid(url, db, uid, pw, model, method, args, kwargs=None, timeout=1800):
     call_args = [db, uid, pw, model, method, args]
     if kwargs is not None:
         call_args.append(kwargs)
@@ -453,11 +453,11 @@ def get_date_chunks(start_str, end_str, max_days=31):
         curr = chunk_end + timedelta(days=1)
     return chunks
 
-def build_direct_financial_xlsx(url, db, uid, pw, fs_type, d_from, d_to, user_ctx, timeout=900):
-    acc_fields = execute_with_uid(url, db, uid, pw, "account.account", "fields_get", [], {"attributes": ["type"]}, timeout=60)
+def build_direct_financial_xlsx(url, db, uid, pw, fs_type, d_from, d_to, user_ctx, timeout=1800):
+    acc_fields = execute_with_uid(url, db, uid, pw, "account.account", "fields_get", [], {"attributes": ["type"]}, timeout=120)
     type_field = "account_type" if "account_type" in acc_fields else ("user_type_id" if "user_type_id" in acc_fields else None)
     fields_to_read = ["id", "code", "name"] + ([type_field] if type_field else [])
-    accounts = execute_with_uid(url, db, uid, pw, "account.account", "search_read", [[]], {"fields": fields_to_read, "limit": 5000}, timeout=120)
+    accounts = execute_with_uid(url, db, uid, pw, "account.account", "search_read", [[]], {"fields": fields_to_read, "limit": 5000}, timeout=180)
     acc_map = {a["id"]: a for a in accounts}
 
     # Determine chunks to avoid Odoo Gateway timeout limits
@@ -565,7 +565,7 @@ def build_direct_financial_xlsx(url, db, uid, pw, fs_type, d_from, d_to, user_ct
 
     return buf.getvalue(), f"{title}_{d_to or 'AsOn'}.xlsx", "read_group_ledger"
 
-def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, btn_method, user_ctx, timeout=1200):
+def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, btn_method, user_ctx, timeout=1800):
     if w.get("action_type") == "direct_fs":
         return build_direct_financial_xlsx(url, db, uid, pw, w.get("fs_type", "pnl"), wiz_vals.get("date_from"), wiz_vals.get("date_to"), user_ctx, timeout=timeout)
 
@@ -617,7 +617,7 @@ def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, 
     candidates = list(dict.fromkeys(
         ([btn_method.strip()] if btn_method and btn_method.strip() else [])
         + prof_btns
-        + ["action_print_report", "print_report", "generate_report", "export_xls", "action_print_xlsx", "check_report"]
+        + ["action_print_report", "print_report", "generate_report", "export_xls", "action_print_xlsx", "check_report", "print_xlsx", "action_export_xlsx"]
     ))
 
     res_action, used_m = None, None
@@ -670,11 +670,12 @@ def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, 
                     file_bytes = base64.b64decode(rec[bf])
                     break
         if not file_bytes:
-            atts = execute_with_uid(url, db, uid, pw, "ir.attachment", "search_read", [[["res_model", "=", w["res_model"]], ["res_id", "=", wiz_id]]], {"fields": ["name", "datas"], "limit": 1, "context": user_ctx}, timeout=timeout)
-            att = next(iter(atts), None) if isinstance(atts, list) else (atts if isinstance(atts, dict) else None)
-            if isinstance(att, dict) and att.get("datas"):
-                file_bytes = base64.b64decode(att["datas"])
-                fname_out = att["name"]
+            atts = execute_with_uid(url, db, uid, pw, "ir.attachment", "search_read", [[["res_model", "=", w["res_model"]], ["res_id", "=", wiz_id]]], {"fields": ["name", "datas"], "limit": 10, "context": user_ctx}, timeout=timeout)
+            for att in (atts if isinstance(atts, list) else [atts] if isinstance(atts, dict) else []):
+                if isinstance(att, dict) and att.get("datas"):
+                    file_bytes = base64.b64decode(att["datas"])
+                    fname_out = att["name"]
+                    break
 
     return file_bytes, fname_out, used_m
 
@@ -689,13 +690,15 @@ CTX_CACHE = {}
 
 def stop_generation():
     CURRENT_RUN["stop"] = True
-    return "🛑 **Stop signal sent! Ready for a new request.**"
+    return "⌑⌁ **Stop signal sent! Ready for a new request.**"
 
 def create_fresh_web_session(url, db, user, pw):
     clean_url = url.strip().rstrip("/")
     sess = requests.Session()
     sess.headers.update({"User-Agent": "Mozilla/5.0"})
-    resp = sess.post(f"{clean_url}/web/session/authenticate", json={"jsonrpc": "2.0", "params": {"db": db, "login": user, "password": pw}}, timeout=30)
+    resp = sess.post(f"{clean_url}/web/session/authenticate", json={"jsonrpc": "2.0", "params": {... if (isinstance(params_json, str) and params_json.strip()) else {}}})
+    # Note: Keep the authentication method intact
+    resp = sess.post(f"{clean_url}/web/session/authenticate", json={"jsonrpc": "2.0", "params": {"db": db, "login": user, "password": pw}}, timeout=60)
     resp.raise_for_status()
     auth_res = resp.json()
     if "error" in auth_res or not auth_res.get("result", {}).get("uid"):
@@ -705,7 +708,7 @@ def create_fresh_web_session(url, db, user, pw):
 def get_cached_context(url, db, uid, pw):
     key = (url.strip().rstrip("/"), db.strip(), uid)
     if key not in CTX_CACHE:
-        CTX_CACHE[key] = execute_with_uid(url, db, uid, pw, "res.users", "context_get", [], timeout=45) or {}
+        CTX_CACHE[key] = execute_with_uid(url, db, uid, pw, "res.users", "context_get", [], timeout=120) or {}
     return CTX_CACHE[key]
 
 def make_progress_html(pct, stage_text, elapsed_sec):
@@ -713,7 +716,7 @@ def make_progress_html(pct, stage_text, elapsed_sec):
     return (
         f'<div style="background: rgba(15, 23, 42, 0.92); border: 1px solid rgba(56, 189, 248, 0.45); border-radius: 10px; padding: 14px; margin-top: 6px;">'
         f'<div style="display: flex; justify-content: space-between; margin-bottom: 6px; font-weight: 700; color: #38bdf8;">'
-        f'<span>⏳ {stage_text}</span><span style="color: #fde047;">{pct}% • {elapsed_sec:.1f}s</span></div>'
+        f'<span>⌑ {stage_text}</span><span style="color: #fde047;">{pct}% • {elapsed_sec:.1f}s</span></div>'
         f'<div style="width: 100%; height: 14px; background: rgba(30, 41, 59, 0.9); border-radius: 7px; overflow: hidden; border: 1px solid rgba(251, 191, 36, 0.35);">'
         f'<div style="width: {pct}%; height: 100%; background: linear-gradient(90deg, #d97706 0%, #f59e0b 50%, #fde047 100%); transition: width 0.4s ease;"></div>'
         f'</div></div>'
@@ -732,7 +735,7 @@ def detect_target_accounts(url, db, uid, pw, w, wiz_vals):
                     elif isinstance(item, int):
                         acc_ids.append(item)
     if acc_ids:
-        accs = execute_with_uid(url, db, uid, pw, "account.account", "search_read", [[["id", "in", list(set(acc_ids))]]], {"fields": ["id", "code", "name"]}, timeout=30)
+        accs = execute_with_uid(url, db, uid, pw, "account.account", "search_read", [[["id", "in", list(set(acc_ids))]]], {"fields": ["id", "code", "name"]}, timeout=60)
         return accs or [], "Selected Wizard Account(s)"
     rname = f"{w.get('name', '')} {w.get('res_model', '')}".lower()
     domain, category = None, "General / Selected Scope"
@@ -745,7 +748,7 @@ def detect_target_accounts(url, db, uid, pw, w, wiz_vals):
     elif any(k in rname for k in ("purchase", "vendor", "bill")):
         domain, category = [["account_type", "in", ["expense", "expense_direct_cost"]]], "Purchase / Direct Cost Accounts"
     if domain:
-        accs = execute_with_uid(url, db, uid, pw, "account.account", "search_read", [domain], {"fields": ["id", "code", "name"], "order": "code asc", "limit": 200}, timeout=45)
+        accs = execute_with_uid(url, db, uid, pw, "account.account", "search_read", [domain], {"fields": ["id", "code", "name"], "order": "code asc", "limit": 200}, timeout=60)
         return accs or [], category
     return [], category
 
@@ -802,7 +805,7 @@ def append_tb_reconciliation_sheet(file_bytes, fname_out, url, db, uid, pw, w, w
     if not fname_out.lower().endswith(".xlsx"):
         return file_bytes, ""
     if not is_accounting_report(w):
-        return file_bytes, "\nℹ️ **Standalone Report (Payroll / HR / Ops):** Exported directly as-is from Odoo."
+        return file_bytes, "\nℹ  **Standalone Report (Payroll / HR / Ops):** Exported directly as-is from Odoo."
 
     try:
         wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
@@ -818,21 +821,21 @@ def append_tb_reconciliation_sheet(file_bytes, fname_out, url, db, uid, pw, w, w
         base_dom = [["parent_state", "=", "posted"]] + ([["account_id", "in", acc_ids]] if acc_ids else [])
         open_map, per_map = {}, {}
         if date_from:
-            for g in (execute_with_uid(url, db, uid, pw, "account.move.line", "read_group", [base_dom + [["date", "<", date_from]], ["account_id", "balance"], ["account_id"]], {"lazy": False}, timeout=90) or []):
+            for g in (execute_with_uid(url, db, uid, pw, "account.move.line", "read_group", [base_dom + [["date", "<", date_from]], ["account_id", "balance"], ["account_id"]], {"lazy": False}, timeout=120) or []):
                 aid = g["account_id"][0] if isinstance(g.get("account_id"), (list, tuple)) else g.get("account_id")
                 if aid:
                     open_map[aid] = float(g.get("balance", 0.0) or 0.0)
 
         per_dom = base_dom + ([["date", ">=", date_from]] if date_from else []) + ([["date", "<=", date_to]] if date_to else [])
-        for g in (execute_with_uid(url, db, uid, pw, "account.move.line", "read_group", [per_dom, ["account_id", "debit", "credit", "balance"], ["account_id"]], {"lazy": False}, timeout=90) or []):
-            aid = g["account_id"][0] if isinstance(g.get("account_id"), (list, tuple)) else g.get("account_id")
-            if aid:
-                per_map[aid] = (float(g.get("debit", 0.0) or 0.0), float(g.get("credit", 0.0) or 0.0), float(g.get("balance", 0.0) or 0.0))
+        for g in (execute_with_uid(url, db, uid, pw, "account.move.line", "read_group", [per_dom, ["account_id", "debit", "credit", "balance"], ["account_id"]], {"lazy": False}, timeout=120) or []):
+                aid = g["account_id"][0] if isinstance(g.get("account_id"), (list, tuple)) else g.get("account_id")
+                if aid:
+                    per_map[aid] = (float(g.get("debit", 0.0) or 0.0), float(g.get("credit", 0.0) or 0.0), float(g.get("balance", 0.0) or 0.0))
 
         if not accs:
             all_ids = sorted(set(list(open_map.keys()) + list(per_map.keys())))
             if all_ids:
-                accs = execute_with_uid(url, db, uid, pw, "account.account", "search_read", [[["id", "in", all_ids]]], {"fields": ["id", "code", "name"], "order": "code asc"}, timeout=45) or []
+                accs = execute_with_uid(url, db, uid, pw, "account.account", "search_read", [[["id", "in", all_ids]]], {"fields": ["id", "code", "name"], "order": "code asc"}, timeout=120) or []
 
         rname_low = w["name"].lower()
         is_cumulative = any(k in rname_low for k in ("grir", "kardex", "inventory", "valuation", "aged", "balance sheet", "receivable", "payable"))
@@ -873,7 +876,7 @@ def append_tb_reconciliation_sheet(file_bytes, fname_out, url, db, uid, pw, w, w
             if date_to:
                 audit_dom.append(["date", "<=", date_to])
 
-            gl_lines = execute_with_uid(url, db, uid, pw, "account.move.line", "search_read", [audit_dom], {"fields": ["date", "account_id", "move_id", "ref", "name", "partner_id", "debit", "credit", "balance"], "limit": 15000}, timeout=90) or []
+            gl_lines = execute_with_uid(url, db, uid, pw, "account.move.line", "search_read", [audit_dom], {"fields": ["date", "account_id", "move_id", "ref", "name", "partner_id", "debit", "credit", "balance"], "limit": 15000}, timeout=120) or []
             for ln in gl_lines:
                 m_name = ln["move_id"][1] if isinstance(ln.get("move_id"), (list, tuple)) else ""
                 ref_s = str(ln.get("ref") or "").strip()
@@ -939,9 +942,9 @@ def append_tb_reconciliation_sheet(file_bytes, fname_out, url, db, uid, pw, w, w
 
         file_stream = io.BytesIO()
         wb.save(file_stream)
-        return file_stream.getvalue(), "\n🏆 **TB Reconciliation Active:** Verified with zero variance against Odoo Posted Trial Balance."
+        return file_stream.getvalue(), "\n   **TB Reconciliation Active:** Verified with zero variance against Odoo Posted Trial Balance."
     except Exception as e:
-        return file_bytes, f"\n⚠️ **TB reconciliation warning:** {str(e)}"
+        return file_bytes, f"\n☑  **TB reconciliation warning:** {str(e)}"
 
 print("✅ Cell 5A-Part 2 loaded!")
 def run_wizard_and_download(url, db, user, pw, selected_label, wiz_map, params_json, btn_method):
@@ -960,7 +963,7 @@ def run_wizard_and_download(url, db, user, pw, selected_label, wiz_map, params_j
         user_ctx = get_cached_context(url, db, uid, pw)
 
         if run_flag["stop"]:
-            yield "🛑 **Request cancelled by user.**", None
+            yield "⌁ **Request cancelled by user.**", None
             return
 
         yield make_progress_html(15, "Validating wizard parameters...", time.time() - t0), None
@@ -973,7 +976,7 @@ def run_wizard_and_download(url, db, user, pw, selected_label, wiz_map, params_j
         }
 
         class LiveStreamOpener:
-            def open(self, target_url, timeout=900):
+            def open(self, target_url, timeout=3600):
                 if run_flag["stop"]:
                     raise Exception("Download cancelled by user.")
                 download_stats["chunks_done"] += 1
@@ -982,7 +985,7 @@ def run_wizard_and_download(url, db, user, pw, selected_label, wiz_map, params_j
                 r = web_sess.get(target_url, timeout=timeout, stream=True)
                 r.raise_for_status()
                 buf = io.BytesIO()
-                for chunk in r.iter_content(chunk_size=524288):
+                for chunk in r.iter_content(chunk_size=1048576):
                     if run_flag["stop"]:
                         r.close()
                         raise Exception("Download cancelled by user.")
@@ -995,24 +998,26 @@ def run_wizard_and_download(url, db, user, pw, selected_label, wiz_map, params_j
                 return buf
 
         pool = ThreadPoolExecutor(max_workers=1)
+        # Increased timeout to 3600 seconds to fully compile extremely large Kardex reports
         fut = pool.submit(
             lambda: fetch_single_wizard_fast(
-                url, db, uid, pw, LiveStreamOpener(), clean_base, w, wiz_vals, btn_method, user_ctx, timeout=900
+                url, db, uid, pw, LiveStreamOpener(), clean_base, w, wiz_vals, btn_method, user_ctx, timeout=3600
             )
         )
         pool.shutdown(wait=False)
 
         while not fut.done():
             if run_flag["stop"]:
-                yield "🛑 **Request cancelled by user. Click Execute to start again.**", None
+                yield "⌁ **Request cancelled by user. Click Execute to start again.**", None
                 return
             elapsed = time.time() - t0
             if download_stats["bytes"] > 0:
-                pct = min(90, 70 + int((download_stats["bytes"] / 1048576) * 0.4))
+                pct = min(95, 70 + int((download_stats["bytes"] / 1048576) * 0.4))
             else:
-                pct = min(68, 18 + int((elapsed / (elapsed + 45.0)) * 50))
+                # Avoid stalling visually at 65-68% while awaiting long DB operations
+                pct = min(88, 18 + int((elapsed / (elapsed + 90.0)) * 70))
             yield make_progress_html(pct, download_stats["stage"], elapsed), None
-            time.sleep(1.2)
+            time.sleep(1.5)
 
         file_bytes, fname_out, _ = fut.result()
         if not file_bytes:
@@ -1031,7 +1036,7 @@ def run_wizard_and_download(url, db, user, pw, selected_label, wiz_map, params_j
         size_mb = len(file_bytes) / 1048576
         yield (
             f"✅ **Completed `{fname_out}`** ({size_mb:.1f} MB) in **{total_sec:.1f}s**!{tb_note}\n\n"
-            f"👉 **Download below** or click **[Direct Browser Download](/file={out_path})**.",
+            f"‑  **Download below** or click **[Direct Browser Download](/file={out_path})**.",
             out_path,
         )
     except Exception as e:
