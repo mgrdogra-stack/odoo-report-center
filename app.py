@@ -475,7 +475,7 @@ def build_direct_financial_xlsx(url, db, uid, pw, fs_type, d_from, d_to, user_ct
         acc_ref = g.get("account_id")
         if not acc_ref:
             continue
-        acc_id = acc_ref[0] if isinstance(acc_ref, (list, tuple)) else acc_ref
+        acc_id = acc_ref if isinstance(acc_ref, (list, tuple)) else acc_ref
         if acc_id not in consolidated:
             consolidated[acc_id] = {"account_id": acc_ref, "debit": 0.0, "credit": 0.0, "balance": 0.0}
         consolidated[acc_id]["debit"] += float(g.get("debit", 0.0) or 0.0)
@@ -491,7 +491,7 @@ def build_direct_financial_xlsx(url, db, uid, pw, fs_type, d_from, d_to, user_ct
     for acc_id, totals in consolidated.items():
         acc = acc_map.get(acc_id, {})
         raw_type = acc.get(type_field, "")
-        type_str = raw_type[1] if isinstance(raw_type, (list, tuple)) and len(raw_type) >= 2 else str(raw_type or "")
+        type_str = raw_type if isinstance(raw_type, (list, tuple)) and len(raw_type) >= 2 else str(raw_type or "")
         low_t = type_str.lower()
 
         is_pnl_acc = any(k in low_t for k in pnl_keys)
@@ -539,7 +539,7 @@ def build_direct_financial_xlsx(url, db, uid, pw, fs_type, d_from, d_to, user_ct
     return buf.getvalue(), f"{title}_{d_to or 'AsOn'}.xlsx", "read_group_ledger"
 
 def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, btn_method, user_ctx, timeout=1800, download_stats=None):
-    """Executes Odoo's native wizard untouched and streams the raw file bytes directly."""
+    """Executes Odoo's native wizard untouched and extracts the binary output directly."""
     if w.get("action_type") == "direct_fs":
         return build_direct_financial_xlsx(url, db, uid, pw, w.get("fs_type", "pnl"), wiz_vals.get("date_from"), wiz_vals.get("date_to"), user_ctx, timeout=timeout)
 
@@ -579,7 +579,7 @@ def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, 
         ftype = f_info[k].get("type")
         if ftype in ("date", "datetime"):
             cleaned = to_odoo_date(v) if v else (today_str if f_info[k].get("required") else "")
-            if len(cleaned) >= 10 and cleaned[4] == "-":
+            if len(cleaned) >= 10 and cleaned == "-":
                 safe_vals[k] = f"{cleaned[:10]} 00:00:00" if (ftype == "datetime" and len(cleaned) == 10) else cleaned
             else:
                 safe_vals[k] = False
@@ -598,11 +598,11 @@ def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, 
     candidates = list(dict.fromkeys(
         ([btn_method.strip()] if btn_method and btn_method.strip() else [])
         + prof_btns
-        + ["action_print_report", "print_report", "generate_report", "export_xls", "action_print_xlsx", "check_report", "print_xlsx", "action_export_xlsx"]
+        + ["action_report_excel", "action_print_report", "print_report", "generate_report", "export_xls", "action_print_xlsx", "check_report", "print_xlsx", "action_export_xlsx"]
     ))
 
     if download_stats:
-        download_stats["stage"] = "Odoo is compiling native report (preserving all movements & adjustments)..."
+        download_stats["stage"] = "Odoo is compiling native report (preserving all monthly movements & adjustments)..."
     res_action, used_m, last_err = None, None, None
     for m in candidates:
         try:
@@ -623,7 +623,7 @@ def fetch_single_wizard_fast(url, db, uid, pw, opener, clean_base, w, wiz_vals, 
         raise last_err
 
     if download_stats:
-        download_stats["stage"] = "Streaming native binary file from Odoo..."
+        download_stats["stage"] = "Downloading compiled file from Odoo..."
 
     file_bytes, fname_out = None, f"{w['name'].replace(' ', '_')}.xlsx"
     if isinstance(res_action, dict) and res_action.get("report_name"):
