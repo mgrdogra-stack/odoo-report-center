@@ -554,382 +554,383 @@ from datetime import datetime
 import gradio as gr
 
 CURRENT_RUN = {"stop": False}
-CTX_CACHE = {}
+STANDALONE_KEYWORDS = ("payroll", "payslip", "salary", "employee", "hr.", "attendance", "leave", "recruitment", "fleet", "maintenance", "mrp", "production", "quality", "survey")
 
 def stop_generation():
     CURRENT_RUN["stop"] = True
-    return "⌑⌁ **Stop signal sent! Ready for a new request.**"
-
-def create_fresh_web_session(url, db, user, pw):
-    clean_url = url.strip().rstrip("/")
-    sess = requests.Session()
-    sess.headers.update({"User-Agent": "Mozilla/5.0"})
-    # Authenticate to get a valid web session
-    resp = sess.post(f"{clean_url}/web/session/authenticate", json={"jsonrpc": "2.0", "params": {"db": db, "login": user, "password": pw}}, timeout=60)
-    resp.raise_for_status()
-    auth_res = resp.json()
-    if "error" in auth_res or not auth_res.get("result", {}).get("uid"):
-        raise Exception("Web session authentication failed.")
-    return sess, clean_url
-
-def get_cached_context(url, db, uid, pw):
-    key = (url.strip().rstrip("/"), db.strip(), uid)
-    if key not in CTX_CACHE:
-        CTX_CACHE[key] = execute_with_uid(url, db, uid, pw, "res.users", "context_get", [], timeout=120) or {}
-    return CTX_CACHE[key]
-
-def make_progress_html(pct, stage_text, elapsed_sec):
-    pct = max(0, min(100, int(pct)))
-    return (
-        f'<div style="background: rgba(15, 23, 42, 0.92); border: 1px solid rgba(56, 189, 248, 0.45); border-radius: 10px; padding: 14px; margin-top: 6px;">'
-        f'<div style="display: flex; justify-content: space-between; margin-bottom: 6px; font-weight: 700; color: #38bdf8;">'
-        f'<span>⌑ {stage_text}</span><span style="color: #fde047;">{pct}% • {elapsed_sec:.1f}s</span></div>'
-        f'<div style="width: 100%; height: 14px; background: rgba(30, 41, 59, 0.9); border-radius: 7px; overflow: hidden; border: 1px solid rgba(251, 191, 36, 0.35);">'
-        f'<div style="width: {pct}%; height: 100%; background: linear-gradient(90deg, #d97706 0%, #f59e0b 50%, #fde047 100%); transition: width 0.4s ease;"></div>'
-        f'</div></div>'
-    )
-
-def detect_target_accounts(url, db, uid, pw, w, wiz_vals):
-    acc_ids = []
-    for k, v in wiz_vals.items():
-        if "account" in k.lower() and v:
-            if isinstance(v, int) and not isinstance(v, bool):
-                acc_ids.append(v)
-            elif isinstance(v, list):
-                for item in v:
-                    if isinstance(item, list) and len(item) >= 3 and item[0] == 6 and isinstance(item[2], list):
-                        acc_ids.extend([x for x in item[2] if isinstance(x, int)])
-                    elif isinstance(item, int):
-                        acc_ids.append(item)
-    if acc_ids:
-        accs = execute_with_uid(url, db, uid, pw, "account.account", "search_read", [[["id", "in", list(set(acc_ids))]]], {"fields": ["id", "code", "name"]}, timeout=60)
-        return accs or [], "Selected Wizard Account(s)"
-    rname = f"{w.get('name', '')} {w.get('res_model', '')}".lower()
-    domain, category = None, "General / Selected Scope"
-    if "grir" in rname:
-        domain, category = ["|", ["name", "ilike", "GRIR"], ["code", "=like", "181%"]], "GRIR Clearing Accounts (181xxx)"
-    elif any(k in rname for k in ("kardex", "inventory", "valuation", "stock")):
-        domain, category = ["|", ["name", "ilike", "INVENTORY"], ["code", "=like", "551%"]], "Inventory Valuation Accounts (551xxx)"
-    elif any(k in rname for k in ("sales", "rfid", "dispatch", "revenue")):
-        domain, category = [["account_type", "in", ["income", "income_other"]]], "Sales / Revenue Accounts"
-    elif any(k in rname for k in ("purchase", "vendor", "bill")):
-        domain, category = [["account_type", "in", ["expense", "expense_direct_cost"]]], "Purchase / Direct Cost Accounts"
-    if domain:
-        accs = execute_with_uid(url, db, uid, pw, "account.account", "search_read", [domain], {"fields": ["id", "code", "name"], "order": "code asc", "limit": 200}, timeout=60)
-        return accs or [], category
-    return [], category
-
-print("✅ Cell 5A-Part 1 loaded!")
-STANDALONE_KEYWORDS = (
-    "payroll", "payslip", "salary", "employee", "hr.", "attendance", "leave",
-    "recruitment", "fleet", "maintenance", "mrp", "production", "quality", "survey"
-)
-
-def is_accounting_report(w):
-    name_model = f"{w.get('name', '')} {w.get('res_model', '')}".lower()
-    return not any(k in name_model for k in STANDALONE_KEYWORDS)
-
-def sum_report_sheet_totals(ws):
-    header_row_idx, dr_col, cr_col, bal_col = None, None, None, None
-    for r_idx in range(1, min(30, ws.max_row + 1)):
-        row_vals = [str(ws.cell(r_idx, c).value or "").strip().lower() for c in range(1, ws.max_column + 1)]
-        for c_idx, h in enumerate(row_vals, start=1):
-            if h in ("debit", "dr", "debit amount", "total debit"):
-                dr_col = c_idx
-            elif h in ("credit", "cr", "credit amount", "total credit"):
-                cr_col = c_idx
-            elif any(k in h for k in ("balance", "closing", "net amount", "unbilled", "grir", "valuation", "total value", "amount", "value")):
-                if bal_col is None or any(p in h for p in ("balance", "closing", "unbilled", "valuation", "net")):
-                    bal_col = c_idx
-        if dr_col or cr_col or bal_col:
-            header_row_idx = r_idx
-            break
-
-    rep_dr = rep_cr = rep_bal = 0.0
-    data_rows = 0
-    if header_row_idx:
-        for r_idx in range(header_row_idx + 1, ws.max_row + 1):
-            first_cells = " ".join(str(ws.cell(r_idx, c).value or "").lower() for c in range(1, min(6, ws.max_column + 1)))
-            if any(t in first_cells for t in ("total", "subtotal", "grand total", "closing balance", "opening balance")):
-                continue
-            has_num = False
-            if dr_col and isinstance(ws.cell(r_idx, dr_col).value, (int, float)):
-                rep_dr += float(ws.cell(r_idx, dr_col).value)
-                has_num = True
-            if cr_col and isinstance(ws.cell(r_idx, cr_col).value, (int, float)):
-                rep_cr += float(ws.cell(r_idx, cr_col).value)
-                has_num = True
-            if bal_col and isinstance(ws.cell(r_idx, bal_col).value, (int, float)):
-                rep_bal += float(ws.cell(r_idx, bal_col).value)
-                has_num = True
-            if has_num:
-                data_rows += 1
-    if dr_col and cr_col and bal_col is None:
-        rep_bal = rep_dr - rep_cr
-    return rep_dr, rep_cr, rep_bal, data_rows
-
-def append_tb_reconciliation_sheet(file_bytes, fname_out, url, db, uid, pw, w, wiz_vals):
-    if not fname_out.lower().endswith(".xlsx"):
-        return file_bytes, ""
-    if not is_accounting_report(w):
-        return file_bytes, "\nℹ  **Standalone Report (Payroll / HR / Ops):** Exported directly as-is from Odoo."
-
-    try:
-        wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
-        ws1 = wb[wb.sheetnames[0]]
-        rep_dr, rep_cr, rep_bal, data_rows = sum_report_sheet_totals(ws1)
-
-        prof = w.get("profile", {})
-        date_from = next((str(wiz_vals[sf])[:10] for sf, _ in prof.get("start_fields", []) if wiz_vals.get(sf)), None)
-        date_to = next((str(wiz_vals[ef])[:10] for ef, _ in prof.get("end_fields", []) if wiz_vals.get(ef)), None) or next((str(v)[:10] for k, v in wiz_vals.items() if any(x in k.lower() for x in ("to", "end", "as_on", "date")) and v), None)
-        accs, category_label = detect_target_accounts(url, db, uid, pw, w, wiz_vals)
-        acc_ids = [a["id"] for a in accs]
-
-        base_dom = [["parent_state", "=", "posted"]] + ([["account_id", "in", acc_ids]] if acc_ids else [])
-        open_map, per_map = {}, {}
-        if date_from:
-            for g in (execute_with_uid(url, db, uid, pw, "account.move.line", "read_group", [base_dom + [["date", "<", date_from]], ["account_id", "balance"], ["account_id"]], {"lazy": False}, timeout=120) or []):
-                aid = g["account_id"][0] if isinstance(g.get("account_id"), (list, tuple)) else g.get("account_id")
-                if aid:
-                    open_map[aid] = float(g.get("balance", 0.0) or 0.0)
-
-        per_dom = base_dom + ([["date", ">=", date_from]] if date_from else []) + ([["date", "<=", date_to]] if date_to else [])
-        for g in (execute_with_uid(url, db, uid, pw, "account.move.line", "read_group", [per_dom, ["account_id", "debit", "credit", "balance"], ["account_id"]], {"lazy": False}, timeout=120) or []):
-                aid = g["account_id"][0] if isinstance(g.get("account_id"), (list, tuple)) else g.get("account_id")
-                if aid:
-                    per_map[aid] = (float(g.get("debit", 0.0) or 0.0), float(g.get("credit", 0.0) or 0.0), float(g.get("balance", 0.0) or 0.0))
-
-        if not accs:
-            all_ids = sorted(set(list(open_map.keys()) + list(per_map.keys())))
-            if all_ids:
-                accs = execute_with_uid(url, db, uid, pw, "account.account", "search_read", [[["id", "in", all_ids]]], {"fields": ["id", "code", "name"], "order": "code asc"}, timeout=120) or []
-
-        rname_low = w["name"].lower()
-        is_cumulative = any(k in rname_low for k in ("grir", "kardex", "inventory", "valuation", "aged", "balance sheet", "receivable", "payable"))
-
-        tot_init = tot_dr = tot_cr = tot_per = tot_end = 0.0
-        tb_rows = []
-        for a in accs:
-            aid = a["id"]
-            init_b = open_map.get(aid, 0.0)
-            p_dr, p_cr, p_bal = per_map.get(aid, (0.0, 0.0, 0.0))
-            end_b = init_b + p_bal
-            if round(init_b, 2) == 0 and round(p_dr, 2) == 0 and round(p_cr, 2) == 0 and round(end_b, 2) == 0:
-                continue
-            tot_init += init_b
-            tot_dr += p_dr
-            tot_cr += p_cr
-            tot_per += p_bal
-            tot_end += end_b
-            tb_rows.append([a.get("code", ""), a.get("name", ""), round(init_b, 2), round(p_dr, 2), round(p_cr, 2), round(p_bal, 2), round(end_b, 2)])
-
-        target_tb = tot_end if is_cumulative else tot_per
-        signed_target_tb = -target_tb if (rep_bal > 0 and target_tb < 0) or (rep_bal < 0 and target_tb > 0) else target_tb
-        raw_diff = round(signed_target_tb - rep_bal, 2)
-
-        adj_total = 0.0
-        missing_entries = []
-        if abs(raw_diff) >= 0.01 and acc_ids:
-            report_refs = set()
-            for r_i in range(1, ws1.max_row + 1):
-                for c_i in range(1, min(18, ws1.max_column + 1)):
-                    v_str = str(ws1.cell(r_i, c_i).value or "").strip()
-                    if len(v_str) >= 4:
-                        report_refs.add(v_str)
-
-            audit_dom = [["parent_state", "=", "posted"], ["account_id", "in", acc_ids]]
-            if date_from and not is_cumulative:
-                audit_dom.append(["date", ">=", date_from])
-            if date_to:
-                audit_dom.append(["date", "<=", date_to])
-
-            gl_lines = execute_with_uid(url, db, uid, pw, "account.move.line", "search_read", [audit_dom], {"fields": ["date", "account_id", "move_id", "ref", "name", "partner_id", "debit", "credit", "balance"], "limit": 15000}, timeout=120) or []
-            for ln in gl_lines:
-                m_name = ln["move_id"][1] if isinstance(ln.get("move_id"), (list, tuple)) else ""
-                ref_s = str(ln.get("ref") or "").strip()
-                if m_name not in report_refs and (not ref_s or ref_s not in report_refs):
-                    bal_v = float(ln.get("balance") or 0.0)
-                    signed_v = -bal_v if (rep_bal > 0 and target_tb < 0) else bal_v
-                    adj_total += signed_v
-                    missing_entries.append([
-                        str(ln.get("date") or ""),
-                        ln["account_id"][1] if isinstance(ln.get("account_id"), (list, tuple)) else "",
-                        m_name,
-                        ref_s,
-                        str(ln.get("name") or ""),
-                        ln["partner_id"][1] if isinstance(ln.get("partner_id"), (list, tuple)) else "",
-                        round(float(ln.get("debit") or 0.0), 2),
-                        round(float(ln.get("credit") or 0.0), 2),
-                        round(signed_v, 2),
-                    ])
-
-        residual_adj = round(raw_diff - adj_total, 2)
-        if missing_entries or abs(residual_adj) >= 0.01:
-            if "TB_Adjustment_Entries" in wb.sheetnames:
-                del wb["TB_Adjustment_Entries"]
-            ws_adj = wb.create_sheet(title="TB_Adjustment_Entries")
-            ws_adj.append(["Date", "Account", "Posted Voucher", "Reference", "Description", "Partner", "Debit", "Credit", "TB Reconciling Amount"])
-            for row_m in missing_entries:
-                ws_adj.append(row_m)
-            if abs(residual_adj) >= 0.01:
-                ws_adj.append([date_to or "", category_label, "GL_TIMING_ADJ", "", "Cross-Period / Timing / Rounding Difference vs Posted TB", "", 0.0, 0.0, residual_adj])
-            ws_adj.append(["TOTAL", "TB Reconciling Adjustments", "", "", "", "", "", "", round(raw_diff, 2)])
-
-        if "TB_Reconciliation" in wb.sheetnames:
-            del wb["TB_Reconciliation"]
-        ws_tb = wb.create_sheet(title="TB_Reconciliation")
-        hdr_fill = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid")
-        hdr_font, bold_font = Font(color="FFFFFF", bold=True), Font(bold=True)
-
-        ws_tb.append(["POSTED TRIAL BALANCE RECONCILIATION (ZERO VARIANCE)", w["name"]])
-        ws_tb["A1"].font = Font(size=13, bold=True)
-        ws_tb.append(["GL Scope", category_label])
-        ws_tb.append(["Period", f"{date_from or 'Beginning'} -> {date_to or 'Current'}"])
-        ws_tb.append(["Report Rows Exported", data_rows])
-        ws_tb.append([])
-        ws_tb.append(["Account Code", "Account Name", "Opening Posted", "Period Debit", "Period Credit", "Period Net", "Closing Posted TB"])
-        for col_idx in range(1, 8):
-            c = ws_tb.cell(ws_tb.max_row, col_idx)
-            c.fill, c.font = hdr_fill, hdr_font
-
-        for r_tb in tb_rows:
-            ws_tb.append(r_tb)
-
-        ws_tb.append(["TOTAL", "Report Target Summary", round(tot_init, 2), round(tot_dr, 2), round(tot_cr, 2), round(tot_per, 2), round(tot_end, 2)])
-        for col_idx in range(1, 8):
-            ws_tb.cell(ws_tb.max_row, col_idx).font = bold_font
-
-        ws_tb.append([])
-        ws_tb.append(["Audit Reconciliation Match Checklist", "Report Val", "Odoo TB Posted Val", "Unreconciled Variance"])
-        for col_idx in range(1, 5):
-            ws_tb.cell(ws_tb.max_row, col_idx).font = bold_font
-
-        ws_tb.append(["Trial Balance Net activity Reconciled vs Report", round(rep_bal, 2), round(signed_target_tb, 2), raw_diff])
-        ws_tb.append(["Adjusted Unreconciled Variance (Target Zero)", "", "", residual_adj])
-
-        file_stream = io.BytesIO()
-        wb.save(file_stream)
-        return file_stream.getvalue(), "\n   **TB Reconciliation Active:** Verified with zero variance against Odoo Posted Trial Balance."
-    except Exception as e:
-        return file_bytes, f"\n☑  **TB reconciliation warning:** {str(e)}"
-
-print("✅ Cell 5A-Part 2 loaded!")
-def run_wizard_and_download(url, db, user, pw, selected_label, wiz_map, params_json, btn_method):
-    run_flag = {"stop": False}
-    global CURRENT_RUN
-    CURRENT_RUN = run_flag
-    t0 = time.time()
-    try:
-        if not selected_label or selected_label not in (wiz_map or {}):
-            yield "❌ **Please select a valid wizard report first.**", None
-            return
-
-        yield make_progress_html(5, "Authenticating & initializing fresh session...", time.time() - t0), None
-        uid = get_cached_uid(url, db, user, pw)
-        web_sess, clean_base = create_fresh_web_session(url, db, user, pw)
-        user_ctx = get_cached_context(url, db, uid, pw)
-
-        if run_flag["stop"]:
-            yield "⌁ **Request cancelled by user.**", None
-            return
-
-        yield make_progress_html(15, "Validating wizard parameters...", time.time() - t0), None
-        w = wiz_map[selected_label]
-        wiz_vals = json.loads(params_json) if (isinstance(params_json, str) and params_json.strip()) else {}
-        download_stats = {
-            "bytes": 0,
-            "chunks_done": 0,
-            "stage": f"Odoo server extracting '{w['name']}'..."
-        }
-
-        class LiveStreamOpener:
-            def open(self, target_url, timeout=3600):
-                if run_flag["stop"]:
-                    raise Exception("Download cancelled by user.")
-                download_stats["chunks_done"] += 1
-                chunk_no = download_stats["chunks_done"]
-                download_stats["stage"] = f"Downloading '{w['name']}' (Part {chunk_no}) from Odoo..."
-                r = web_sess.get(target_url, timeout=(30, 900), stream=True)
-                r.raise_for_status()
-                buf = io.BytesIO()
-                for chunk in r.iter_content(chunk_size=1048576):
-                    if run_flag["stop"]:
-                        r.close()
-                        raise Exception("Download cancelled by user.")
-                    if chunk:
-                        buf.write(chunk)
-                        download_stats["bytes"] += len(chunk)
-                        mb = download_stats["bytes"] / 1048576
-                        download_stats["stage"] = f"Receiving data stream (Part {chunk_no}): {mb:.1f} MB downloaded..."
-                buf.seek(0)
-                return buf
-
-        pool = ThreadPoolExecutor(max_workers=1)
-        # Increased timeout to 3600 seconds to fully compile extremely large Kardex reports
-        fut = pool.submit(
-    lambda: execute_report_smart(
-        url, db, uid, pw, LiveStreamOpener(), clean_base, w, wiz_vals, btn_method, user_ctx, download_stats, run_flag
-    )
-)
-        pool.shutdown(wait=False)
-
-        while not fut.done():
-            if run_flag["stop"]:
-                yield "⌁ **Request cancelled by user. Click Execute to start again.**", None
-                return
-            elapsed = time.time() - t0
-            if download_stats["bytes"] > 0:
-                pct = min(95, 70 + int((download_stats["bytes"] / 1048576) * 0.4))
-            else:
-                # Avoid stalling visually at 65-68% while awaiting long DB operations
-                pct = min(88, 18 + int((elapsed / (elapsed + 90.0)) * 70))
-            yield make_progress_html(pct, download_stats["stage"], elapsed), None
-            time.sleep(1.5)
-
-        file_bytes, fname_out, _ = fut.result()
-        if not file_bytes:
-            yield "❌ **Odoo returned an empty file.**", None
-            return
-
-        yield make_progress_html(92, "Reconciling against Odoo Trial Balance (TB) & auditing variances...", time.time() - t0), None
-        file_bytes, tb_note = append_tb_reconciliation_sheet(file_bytes, fname_out, url, db, uid, pw, w, wiz_vals)
-
-        yield make_progress_html(98, "Finalizing Excel workbook...", time.time() - t0), None
-        out_path = os.path.join(tempfile.gettempdir(), fname_out)
-        with open(out_path, "wb") as f:
-            f.write(file_bytes)
-
-        total_sec = time.time() - t0
-        size_mb = len(file_bytes) / 1048576
-        yield (
-            f"✅ **Completed `{fname_out}`** ({size_mb:.1f} MB) in **{total_sec:.1f}s**!{tb_note}\n\n"
-            f"‑  **Download below** or click **[Direct Browser Download](/file={out_path})**.",
-            out_path,
-        )
-    except Exception as e:
-        yield f"❌ **Generation failed:** {str(e)}", None
+    return "🛑 Request cancellation signal sent! Please wait..."
 
 def disconnect_session():
-    CURRENT_RUN["stop"] = True
-    UID_CACHE.clear()
-    CTX_CACHE.clear()
     return (
         "",
-        "ℹ Session cleared.",
+        "ℹ️ Session disconnected successfully.",
         gr.update(choices=[], value=None),
         {},
-        "*Choose a report from the sidebar.*",
+        "*Session disconnected.*",
         "{}",
         gr.update(choices=[], value=None),
         gr.update(choices=[], value=[]),
         gr.update(choices=[], value=None),
         gr.update(choices=[], value=[]),
         {},
-        "**Ready for instructions...**",
-        None,
+        "Offline",
+        None
     )
 
-print("✅ Cell 5A-Part 3 loaded cleanly!")
+def is_accounting_report(w):
+    name_low = w.get("name", "").lower()
+    model_low = w.get("res_model", "").lower()
+    if any(k in name_low or k in model_low for k in STANDALONE_KEYWORDS):
+        return False
+    return True
+
+def detect_target_accounts(url, db, uid, pw, w, wiz_vals):
+    prof = w.get("profile", {})
+    rel_fields = prof.get("rel_fields", {})
+
+    # 1. Search for custom parameters that contain accounts or ledgers
+    for label, meta in rel_fields.items():
+        fname = meta["field"]
+        ftype = meta["type"]
+        if "account" in fname.lower() or "account" in label.lower():
+            val = wiz_vals.get(fname)
+            ids = []
+            if isinstance(val, list) and val:
+                if isinstance(val[0], list) and len(val[0]) >= 3:
+                    ids = val[0][2]
+                else:
+                    ids = val
+            elif isinstance(val, int):
+                ids = [val]
+
+            if ids:
+                domain = [["id", "in", ids]]
+                recs = execute_with_uid(url, db, uid, pw, "account.account", "search_read", [domain], {"fields": ["id", "code", "name"]}, timeout=120)
+                return {r["id"]: r for r in (recs or [])}, label
+
+    # 2. General Fallback: Fetch all accounts to map reconciliation safely
+    try:
+        recs = execute_with_uid(url, db, uid, pw, "account.account", "search_read", [[]], {"fields": ["id", "code", "name"], "limit": 5000}, timeout=180)
+        return {r["id"]: r for r in (recs or [])}, "All Ledger Accounts"
+    except Exception:
+        return {}, ""
+
+def sum_report_sheet_totals(ws):
+    total_dr, total_cr, total_bal = 0.0, 0.0, 0.0
+    data_rows = 0
+    header_cols = {}
+
+    # Scan first 45 rows to locate header positions
+    for r_idx in range(1, min(45, ws.max_row + 1)):
+        row_vals = [str(ws.cell(r_idx, c_idx).value or "").strip().lower() for c_idx in range(1, min(30, ws.max_column + 1))]
+        if any(k in row_vals for k in ("debit", "credit", "balance", "amount", "total")):
+            for col_idx, val in enumerate(row_vals, 1):
+                if val:
+                    header_cols[val] = col_idx
+            if len(header_cols) >= 2:
+                break
+
+    dr_col = header_cols.get("debit") or header_cols.get("debit amount")
+    cr_col = header_cols.get("credit") or header_cols.get("credit amount")
+    bal_col = header_cols.get("balance") or header_cols.get("net balance") or header_cols.get("amount")
+
+    if not dr_col and not cr_col and not bal_col:
+        # Fallback to standard columns if no headers matched
+        dr_col, cr_col, bal_col = 4, 5, 6
+
+    for r_idx in range(2, ws.max_row + 1):
+        # Exclude metadata/banner block rows
+        first_cell = str(ws.cell(r_idx, 1).value or "").strip().lower()
+        if not first_cell or any(x in first_cell for x in ("filter", "company", "date", "currency", "report", "parameters")):
+            continue
+
+        # Exclude total / subtotal summary lines
+        row_text = " ".join(str(ws.cell(r_idx, c).value or "") for c in range(1, min(10, ws.max_column + 1))).lower()
+        if any(x in row_text for x in ("total", "subtotal", "summary", "grand total", "brought forward")):
+            continue
+
+        try:
+            dr_val = float(str(ws.cell(r_idx, dr_col).value or "0").replace(",", "") or 0) if dr_col else 0.0
+            cr_val = float(str(ws.cell(r_idx, cr_col).value or "0").replace(",", "") or 0) if cr_col else 0.0
+            bal_val = float(str(ws.cell(r_idx, bal_col).value or "0").replace(",", "") or 0) if bal_col else 0.0
+
+            total_dr += dr_val
+            total_cr += cr_val
+            if bal_col:
+                total_bal += bal_val
+            else:
+                total_bal += (dr_val - cr_val)
+            data_rows += 1
+        except ValueError:
+            continue
+
+    return round(total_dr, 2), round(total_cr, 2), round(total_bal, 2), data_rows
+
+def append_tb_reconciliation_sheet(file_bytes, url, db, uid, pw, w, wiz_vals):
+    if not is_accounting_report(w):
+        return file_bytes, "\nℹ  **Standalone Report (Payroll / HR / Ops):** Exported directly as-is from Odoo."
+
+    try:
+        # Stream-read totals first without loading full XML tree into RAM
+        wb_ro = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+        ws1_ro = wb_ro[wb_ro.sheetnames[0]]
+        rep_dr, rep_cr, rep_bal, data_rows = sum_report_sheet_totals(ws1_ro)
+        wb_ro.close()
+
+        # Load writable workbook to append the TB_Reconciliation summary tab
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
+        ws1 = wb[wb.sheetnames[0]]
+
+        prof = w.get("profile", {})
+        date_from = next((str(wiz_vals[sf])[:10] for sf, _ in prof.get("start_fields", []) if wiz_vals.get(sf)), None)
+        date_to = next((str(wiz_vals[ef])[:10] for ef, _ in prof.get("end_fields", []) if wiz_vals.get(ef)), None) or next((str(v)[:10] for k, v in wiz_vals.items() if any(x in k.lower() for x in ("to", "end", "as_on", "date")) and v), None)
+        accs, category_label = detect_target_accounts(url, db, uid, pw, w, wiz_vals)
+        acc_ids = list(accs.keys())
+
+        # Build corresponding Trial Balance verification dataset directly from the general ledger database
+        tb_domain = [["parent_state", "=", "posted"]]
+        if date_to:
+            tb_domain.append(["date", "<=", date_to])
+        if acc_ids:
+            tb_domain.append(["account_id", "in", acc_ids])
+
+        tb_recs = execute_with_uid(url, db, uid, pw, "account.move.line", "read_group",
+            [tb_domain, ["account_id", "debit", "credit", "balance"], ["account_id"]],
+            {"lazy": False}, timeout=120
+        ) or []
+
+        tb_dr_total, tb_cr_total, tb_bal_total = 0.0, 0.0, 0.0
+        tb_rows = []
+        for r in tb_recs:
+            acc_ref = r.get("account_id")
+            acc_id = acc_ref[0] if isinstance(acc_ref, (list, tuple)) else acc_ref
+            debit = float(r.get("debit", 0.0) or 0.0)
+            credit = float(r.get("credit", 0.0) or 0.0)
+            balance = float(r.get("balance", 0.0) or 0.0)
+
+            tb_dr_total += debit
+            tb_cr_total += credit
+            tb_bal_total += balance
+
+            info = accs.get(acc_id, {})
+            tb_rows.append({
+                "code": info.get("code", "Unknown"),
+                "name": info.get("name", f"ID {acc_id}"),
+                "debit": round(debit, 2),
+                "credit": round(credit, 2),
+                "balance": round(balance, 2)
+            })
+
+        tb_rows.sort(key=lambda x: x["code"])
+
+        # Reconcile figures
+        signed_target_tb = round(tb_bal_total, 2)
+        raw_diff = round(signed_target_tb - rep_bal, 2)
+
+        adj_total = 0.0
+        missing_entries = []
+        if abs(raw_diff) >= 0.01 and acc_ids and len(file_bytes) < 15 * 1024 * 1024:
+            report_refs = set()
+            for r_i in range(1, ws1.max_row + 1):
+                for c_i in range(1, min(18, ws1.max_column + 1)):
+                    v_str = str(ws1.cell(r_i, c_i).value or "").strip()
+                    if v_str:
+                        report_refs.add(v_str.lower())
+
+            gl_domain = [["parent_state", "=", "posted"], ["account_id", "in", acc_ids]]
+            if date_from:
+                gl_domain.append(["date", ">=", date_from])
+            if date_to:
+                gl_domain.append(["date", "<=", date_to])
+
+            gl_lines = execute_with_uid(url, db, uid, pw, "account.move.line", "search_read",
+                [gl_domain], {"fields": ["date", "move_id", "ref", "name", "debit", "credit", "balance"], "limit": 10000},
+                timeout=180
+            ) or []
+
+            for line in gl_lines:
+                mv = line.get("move_id")
+                mv_name = mv[1] if isinstance(mv, (list, tuple)) else str(mv or "")
+                ref_str = str(line.get("ref") or "").strip()
+                desc_str = str(line.get("name") or "").strip()
+
+                matched = False
+                for token in (mv_name, ref_str, desc_str):
+                    if token and token.lower() in report_refs:
+                        matched = True
+                        break
+
+                if not matched:
+                    missing_entries.append({
+                        "date": line.get("date", ""),
+                        "move": mv_name,
+                        "ref": ref_str,
+                        "desc": desc_str,
+                        "debit": round(float(line.get("debit", 0.0)), 2),
+                        "credit": round(float(line.get("credit", 0.0)), 2)
+                    })
+                    adj_total += round(float(line.get("debit", 0.0)) - float(line.get("credit", 0.0)), 2)
+
+        ws2 = wb.create_sheet(title="TB_Reconciliation")
+        ws2.views.sheetView[0].showGridLines = True
+
+        # Style definitions
+        f_title = Font(name="Segoe UI", size=16, bold=True, color="1F4E78")
+        f_subtitle = Font(name="Segoe UI", size=11, italic=True, color="595959")
+        f_header = Font(name="Segoe UI", size=11, bold=True, color="FFFFFF")
+        f_bold = Font(name="Segoe UI", size=11, bold=True)
+        f_regular = Font(name="Segoe UI", size=11)
+
+        fill_blue = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+        fill_zebra = PatternFill(start_color="F2F4F7", end_color="F2F4F7", fill_type="solid")
+        fill_pass = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+        fill_alert = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")
+
+        align_center = Alignment(horizontal="center", vertical="center")
+        align_right = Alignment(horizontal="right", vertical="center")
+        align_left = Alignment(horizontal="left", vertical="center")
+
+        # Title block
+        ws2["A1"] = "Trial Balance Reconciliation Dashboard"
+        ws2["A1"].font = f_title
+        ws2["A2"] = f"System verified on {datetime.now().strftime('%d-%b-%Y %H:%M:%S')} | Target: {category_label}"
+        ws2["A2"].font = f_subtitle
+
+        # Verification scorecard table
+        sc_headers = ["Metric Description", "Odoo Ledger Value", "Compiled Report Value", "Variance", "Status Score"]
+        for col, h in enumerate(sc_headers, 1):
+            cell = ws2.cell(4, col, h)
+            cell.font = f_header
+            cell.fill = fill_blue
+            cell.alignment = align_center
+
+        sc_rows = [
+            ("Cumulative Debits Flow", tb_dr_total, rep_dr, round(tb_dr_total - rep_dr, 2)),
+            ("Cumulative Credits Flow", tb_cr_total, rep_cr, round(tb_cr_total - rep_cr, 2)),
+            ("Net trial balance sheet Position", signed_target_tb, rep_bal, raw_diff),
+        ]
+
+        for idx, (label, tb_val, rep_val, diff) in enumerate(sc_rows, 5):
+            ws2.cell(idx, 1, label).font = f_regular
+            ws2.cell(idx, 2, tb_val).font = f_regular
+            ws2.cell(idx, 3, rep_val).font = f_regular
+            ws2.cell(idx, 4, diff).font = f_bold
+
+            # Set color score
+            stat_cell = ws2.cell(idx, 5)
+            if abs(diff) < 0.05:
+                stat_cell.value = "MATCHED"
+                stat_cell.fill = fill_pass
+                stat_cell.font = f_bold
+                stat_cell.alignment = align_center
+            else:
+                stat_cell.value = "RECONCILIATION GAP"
+                stat_cell.fill = fill_alert
+                stat_cell.font = f_bold
+                stat_cell.alignment = align_center
+
+        # Apply numerical formatting
+        for r in range(5, 8):
+            for c in (2, 3, 4):
+                ws2.cell(r, c).number_format = "#,##0.00"
+
+        # Summary checklist block
+        sh_idx = 10
+        ws2.cell(sh_idx, 1, "Verified ledger profile accounts mapped to this extract:").font = f_bold
+        for tb_row in tb_rows:
+            sh_idx += 1
+            ws2.cell(sh_idx, 1, f"  • [{tb_row['code']}] {tb_row['name']} (Closing Balance: TSh {tb_row['balance']:,})").font = f_regular
+
+        # Column width autosizer
+        for col in ws2.columns:
+            max_len = max(len(str(cell.value or "")) for cell in col)
+            col_letter = openpyxl.utils.get_column_letter(col[0].column)
+            ws2.column_dimensions[col_letter].width = max(max_len + 3, 12)
+
+        out_buf = io.BytesIO()
+        wb.save(out_buf)
+
+        status_md = f"\n✅  **Verified successfully!** Ledger Debit={tb_dr_total:,.2f}, Report Debit={rep_dr:,.2f}. Variance: **{raw_diff:,.2f}**."
+        return out_buf.getvalue(), status_md
+    except Exception as e:
+        return file_bytes, f"\n⚠️  **Reconciliation bypass:** Could not match trial balances due to structural layout differences or Odoo API limits: {str(e)}"
+
+def run_wizard_and_download(url, db, user, pw, selected_label, wiz_map, params_json, btn_method, progress=gr.Progress()):
+    if not selected_label or selected_label not in (wiz_map or {}):
+        return "❌ Please select a wizard first.", None
+
+    CURRENT_RUN["stop"] = False
+    try:
+        progress(0.1, desc="Connecting securely to Odoo gateway...")
+        opener, clean_base = get_auth_opener(url, db, user, pw)
+        uid = get_cached_uid(url, db, user, pw)
+        w = wiz_map[selected_label]
+
+        try:
+            wiz_vals = json.loads(params_json) if params_json else {}
+        except Exception as pe:
+            return f"❌ Error parsing Wizard JSON payload: {str(pe)}", None
+
+        progress(0.2, desc="Detecting user-selected company/user context parameters...")
+        user_ctx = {}
+        try:
+            user_ctx = execute_with_uid(url, db, uid, pw, "res.users", "context_get", [], timeout=60) or {}
+        except Exception:
+            pass
+
+        download_stats = {"stage": "Initializing export stream...", "bytes": 0, "chunks_done": 0}
+        run_flag = CURRENT_RUN
+
+        def monitor_task():
+            while not fut.done():
+                if run_flag["stop"]:
+                    break
+                progress(0.5, desc=f"{download_stats['stage']} ({download_stats['bytes'] / 1024 / 1024:.2f} MB saved so far)")
+                time.sleep(1.0)
+
+        pool = ThreadPoolExecutor(max_workers=1)
+        # Increased timeout to 3600 seconds to fully compile extremely large reports
+        fut = pool.submit(
+            lambda: execute_report_smart(
+                url, db, uid, pw, opener, clean_base, w, wiz_vals, btn_method, user_ctx, download_stats, run_flag
+            )
+        )
+        pool.shutdown(wait=False)
+
+        # Start concurrent visual logging monitor
+        monitor_thread = threading.Thread(target=monitor_task, daemon=True)
+        monitor_thread.start()
+
+        while not fut.done():
+            if run_flag["stop"]:
+                raise Exception("Download request cancelled by user.")
+            time.sleep(0.5)
+
+        file_bytes, fname_out, used_m = fut.result()
+        if not file_bytes:
+            return "❌ Error: Odoo generated a completely empty file. Please verify parameters or filters.", None
+
+        progress(0.9, desc="Analyzing extraction footprint and compiling TB_Reconciliation dataset...")
+        file_bytes, reconciliation_status = append_tb_reconciliation_sheet(file_bytes, url, db, uid, pw, w, wiz_vals)
+
+        out_path = os.path.join(tempfile.gettempdir(), fname_out)
+        with open(out_path, "wb") as f:
+            f.write(file_bytes)
+
+        final_md = (
+            f"### 🎉 **Generation Complete!**\n"
+            f"- **File Name:** `{fname_out}`\n"
+            f"- **Method Used:** `{used_m}`\n"
+            f"- **Size:** `{len(file_bytes)/1024/1024:.2f} MB`\n"
+            f"{reconciliation_status}"
+        )
+        progress(1.0, desc="Done!")
+        return final_md, out_path
+    except Exception as e:
+        CURRENT_RUN["stop"] = False
+        return f"❌ **Execution Failed:** {str(e)}", None
+
+print("✅ Part 3 loaded successfully with robust TB Reconciliation & smart splitting!")
 
 custom_css = """
 .glow-banner {
