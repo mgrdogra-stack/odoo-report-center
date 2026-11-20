@@ -696,8 +696,7 @@ def create_fresh_web_session(url, db, user, pw):
     clean_url = url.strip().rstrip("/")
     sess = requests.Session()
     sess.headers.update({"User-Agent": "Mozilla/5.0"})
-    resp = sess.post(f"{clean_url}/web/session/authenticate", json={"jsonrpc": "2.0", "params": {... if (isinstance(params_json, str) and params_json.strip()) else {}}})
-    # Note: Keep the authentication method intact
+    # Authenticate to get a valid web session
     resp = sess.post(f"{clean_url}/web/session/authenticate", json={"jsonrpc": "2.0", "params": {"db": db, "login": user, "password": pw}}, timeout=60)
     resp.raise_for_status()
     auth_res = resp.json()
